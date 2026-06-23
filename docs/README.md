@@ -6,9 +6,9 @@
 
 ## 📊 文档统计
 
-- **文档总数**: 38 个（含各目录 README）
-- **总行数**: ~48,000 行
-- **分类目录**: 6 个
+- **文档总数**: 48 个（含各目录 README）
+- **总行数**: ~55,000 行
+- **分类目录**: 7 个
 - **覆盖度**: vLLM 95%, vLLM-Ascend 95%, Mooncake 90%, Ascend 通信 100%, 多模态 95%, PD分离 100%
 
 ---
@@ -19,10 +19,14 @@
 docs/
 ├── README.md                     # 主文档索引
 ├── vllm-core/                    # vLLM 核心架构（7 个文档）
-├── vllm-ascend/                  # vLLM-Ascend 架构（5 个文档）
+├── vllm-ascend/                  # vLLM-Ascend 架构（6 个文档）
 ├── ascend-communication/         # Ascend 通信系统（6 个文档）
 ├── mooncake/                     # Mooncake 项目（4 个文档）
 ├── components/                   # vLLM 组件详解（10 个文档）
+├── tests/                        # 测试文档
+│   ├── multimodal/               # 多模态测试（6 个文档）
+│   ├── omni/                     # Omni 测试（2 个文档）
+│   └── ascend/                   # Ascend 测试（1 个文档）
 └── other/                        # 其他文档（4 个文档）
 ```
 

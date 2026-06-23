@@ -74,11 +74,26 @@
 
 ---
 
+### 6. [vLLM 与 vllm-ascend MoE/EP 支持分析](vLLM与vllm-ascend_MoE_EP支持分析.md)
+**文件大小**: ~240KB | **创建时间**: 2026-06-23
+
+**核心内容**:
+- MoE 基础概念与 Expert Parallelism 原理
+- vLLM CUDA MoE 实现（Triton 内核、EPLB、All2All）
+- vllm-ascend NPU MoE 实现（华为融合算子、MC2 通信）
+- EP 相关启动参数详解
+- 源码深度分析（CUDA vs Ascend）
+- 架构设计、数据流、性能瓶颈分析
+
+**适用人群**: MoE 模型开发者、架构师、性能优化工程师
+
+---
+
 ## 📊 统计信息
 
-- **文档总数**: 5 个
-- **总行数**: ~4,000 行
-- **覆盖模块**: NPUPlatform, Attention Backends, Distributed, Quantization, 310P, XLite, EPLB
+- **文档总数**: 6 个
+- **总行数**: ~6,500 行
+- **覆盖模块**: NPUPlatform, Attention Backends, Distributed, Quantization, 310P, XLite, EPLB, MoE/EP
 
 ---
 
