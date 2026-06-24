@@ -103,11 +103,27 @@
 
 ---
 
+### 8. [vLLM 并行策略详解：权重划分与推理处理](vllm_parallel_strategies_weight_partition.md) ⭐ 新增
+**文件大小**: ~50KB | **创建时间**: 2026-06-24
+
+**核心内容**:
+- TP/DP/PP/EP 四种并行策略详解
+- 权重划分方式（详细图解）
+- Attention/MLP/MoE层权重切分
+- 推理处理流程
+- 混合并行策略组合
+- 通信开销对比
+- 实际案例分析（Llama-70B, Mixtral-8x7B）
+
+**适用人群**: 分布式推理开发者、架构师、运维工程师
+
+---
+
 ## 📊 统计信息
 
-- **文档总数**: 7 个
-- **总行数**: ~4,400 行
-- **覆盖模块**: AsyncLLM, EngineCore, Scheduler, Worker, Speculative Decoding, Structured Output, 模型适配
+- **文档总数**: 8 个
+- **总行数**: ~5,000+ 行
+- **覆盖模块**: AsyncLLM, EngineCore, Scheduler, Worker, Speculative Decoding, Structured Output, 模型适配, 并行策略
 
 ---
 
