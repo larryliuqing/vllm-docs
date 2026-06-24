@@ -6,10 +6,10 @@
 
 ## 📊 文档统计
 
-- **文档总数**: 48 个（含各目录 README）
-- **总行数**: ~55,000 行
-- **分类目录**: 7 个
-- **覆盖度**: vLLM 95%, vLLM-Ascend 95%, Mooncake 90%, Ascend 通信 100%, 多模态 95%, PD分离 100%
+- **文档总数**: 60+ 个（含各目录 README）
+- **总行数**: ~60,000+ 行
+- **分类目录**: 7 个主目录 + 6 个测试子目录
+- **覆盖度**: vLLM 95%, vLLM-Ascend 95%, Mooncake 90%, Ascend 通信 100%, 多模态 95%, PD分离 100%, MOE 100%
 
 ---
 
@@ -23,10 +23,13 @@ docs/
 ├── ascend-communication/         # Ascend 通信系统（6 个文档）
 ├── mooncake/                     # Mooncake 项目（4 个文档）
 ├── components/                   # vLLM 组件详解（10 个文档）
-├── tests/                        # 测试文档
+├── tests/                        # 测试文档（整合目录）
 │   ├── multimodal/               # 多模态测试（6 个文档）
-│   ├── omni/                     # Omni 测试（2 个文档）
-│   └── ascend/                   # Ascend 测试（1 个文档）
+│   ├── omni/                     # Omni镜像对比测试（2 个文档）
+│   ├── moe/                      # MOE参数测试（11 个文档）⭐ 新增
+│   ├── ascend/                   # Ascend 测试（1 个文档）
+│   ├── test_reports/             # 测试报告⭐ 新增
+│   └── test_scripts/             # 测试脚本⭐ 新增
 └── other/                        # 其他文档（4 个文档）
 ```
 
@@ -205,6 +208,44 @@ docs/
 
 ---
 
+### 七、测试文档（[tests/](tests/)）
+
+**文档数量**: 25+ 个
+
+#### 子目录：
+
+1. **[multimodal/](tests/multimodal/)** - 多模态测试（6 个文档）
+   - Qwen2-VL-7B测试指南和完整报告
+   - Qwen3-VL-32B测试指南和失败报告
+   - 多模态模型对比测试方案
+   - 多模态模型推荐与下载指南
+
+2. **[omni/](tests/omni/)** - Omni镜像对比测试（2 个文档）
+   - vllm-ascend vs vllm-omni对比测试
+   - vllm镜像最终对比报告
+
+3. **[moe/](tests/moe/)** - MOE参数测试（11 个文档）⭐ 新增
+   - MOE参数测试指南和计划
+   - MOE启动状态文档
+   - MOE测试成功/最终/进展报告
+   - Qwen3-Omni-30B测试指南
+   - 4卡部署和性能测试报告
+   - 测试脚本（5个shell脚本）
+
+4. **[ascend/](tests/ascend/)** - Ascend测试（1 个文档）
+   - vLLM昇腾NPU测试指南
+
+5. **[test_reports/](tests/test_reports/)** - 测试报告 ⭐ 新增
+   - PD分离测试报告（2026-06-24）
+
+6. **[test_scripts/](tests/test_scripts/)** - 测试脚本 ⭐ 新增
+   - PD分离部署脚本
+   - Prefill/Decode启动脚本
+
+**适用人群**: 测试工程师、运维工程师、技术选型决策者
+
+---
+
 ## 🎯 快速导航
 
 ### 按角色推荐阅读
@@ -273,7 +314,7 @@ docs/
 | **Ascend 通信** | ✅ 100% | 4 | HCOMM, HCCL, HIXL |
 | **Mooncake** | ✅ 90% | 4 | Transfer Engine, Mooncake Store, P2P Store, HIXL 集成 |
 | **组件详解** | ✅ 95% | 10 | 算子分类、模型适配、PD分离、测试场景、KV Transfer、CPU Loading |
-| **多模态架构** | ✅ 95% | 1 | 数据结构、处理流程、模型实现、调度优化 |
+| **测试文档** | ✅ 100% | 25+ | 多模态测试、Omni测试、MOE测试、PD分离测试、测试脚本 |
 
 ---
 
@@ -299,6 +340,11 @@ docs/
 6. ✅ **多模态架构文档**: 详细解析 vLLM 多模态支持架构和实现原理
 7. ✅ **算子与模型适配**: 详细解析vLLM与vLLM-Ascend的算子调用机制和模型适配流程
 8. ✅ **文档分类优化**: 将8个未分类文档移动到相应分类目录
+9. ✅ **测试文档整合**（2026-06-24 新增）:
+   - 将 `omni-test` 目录移动到 `docs/tests/moe/`
+   - 将 `test_reports` 和 `test_scripts` 整合到 `tests/` 目录
+   - 新增 MOE 测试分类（11个文档+5个脚本）
+   - 新增 PD分离测试报告和脚本
 
 ---
 
@@ -320,5 +366,5 @@ docs/
 
 ---
 
-**最后更新**: 2026-06-20  
+**最后更新**: 2026-06-24
 **维护者**: vLLM 项目分析团队
