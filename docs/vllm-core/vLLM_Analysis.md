@@ -436,6 +436,8 @@ weights_iterator = np_cache_weights_iterator(...)
 
 ### 4.1 请求处理架构
 
+![vLLM QA Flow](../images/vllm-qa-flow.png)
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    用户请求入口                              │
