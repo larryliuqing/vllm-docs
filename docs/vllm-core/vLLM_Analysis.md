@@ -19,6 +19,8 @@ vLLM 是一个高性能的大语言模型推理引擎，其核心优势在于：
 
 ### 核心架构
 
+![vLLM Architecture](../images/vllm-architecture.png)
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                     LLM Engine (v1)                        │
@@ -38,6 +40,10 @@ vLLM 是一个高性能的大语言模型推理引擎，其核心优势在于：
 ---
 
 ## 2. 模型适配机制
+
+### 2.0 硬件支持
+
+![vLLM Hardware Support](../images/vLLM-hardware-support.png)
 
 ### 2.1 模型注册机制
 
