@@ -4,6 +4,12 @@
 
 ---
 
+## 🏗️ 整体架构
+
+![vLLM Architecture](images/vllm-architecture.png)
+
+---
+
 ## 📊 文档统计
 
 - **文档总数**: 70+ 个（含各目录 README）
