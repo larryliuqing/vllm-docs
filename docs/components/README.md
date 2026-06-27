@@ -169,10 +169,25 @@
 
 ---
 
+### 14. [vLLM-Ascend 集成架构与 Patch 机制详解](vllm_ascend_integration_architecture.md)
+**文件大小**: ~15KB | **创建时间**: 2026-06-27
+
+**核心内容**:
+- vLLM-Ascend 插件化注册机制（Entry Points）
+- 两阶段 Patch 应用（平台级 + Worker 级）
+- 45+ Monkey Patch 详细清单和作用
+- Attention 后端路由机制
+- DS V4 模型级覆盖
+- AscendCompiler 图融合优化
+
+**适用人群**: 核心开发者、Ascend 适配开发者、性能优化工程师
+
+---
+
 ## 📊 统计信息
 
-- **文档总数**: 13 个
-- **覆盖组件**: 算子、模型适配、PD分离（架构/分析/源码）、Model Runner、KV Transfer、CPU Loading、安装指南
+- **文档总数**: 14 个
+- **覆盖组件**: 算子、模型适配、PD分离（架构/分析/源码）、Model Runner、KV Transfer、CPU Loading、安装指南、Ascend集成
 
 ---
 
