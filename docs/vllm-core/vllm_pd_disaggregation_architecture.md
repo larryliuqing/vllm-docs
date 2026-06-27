@@ -156,45 +156,56 @@ graph TB
 
 ### 2.3 KV Transfer 配置
 
-**配置类**: `vllm/config/kv_transfer.py`
+**配置类**: `vllm/config/kv_transfer.py`:
 
 ```python
+from typing import Literal
+from dataclasses import field
+from vllm.config.utils import config
+
+KVProducer = Literal["kv_producer", "kv_both"]
+KVConsumer = Literal["kv_consumer", "kv_both"]
+KVRole = Literal[KVProducer, KVConsumer]
+
 @config
 class KVTransferConfig:
-    """Configuration for distributed KV cache transfer."""
-    
+    """分布式 KV Cache 传输配置"""
+
     kv_connector: str | None = None
-    """KV connector 名称"""
+    """KV connector 名称（如 MooncakeConnectorV1、P2pNcclConnector）"""
     
     engine_id: str | None = None
-    """Engine ID（UUID）"""
+    """Engine ID（未指定时自动生成为 UUID）"""
     
-    kv_buffer_device: str = "cuda"  # 或 "npu"
+    kv_buffer_device: str = "npu"  # 自动检测设备类型
     """KV buffer 设备（cuda/cpu/xpu/npu）"""
     
     kv_buffer_size: float = 1e9
-    """Buffer 大小（字节）"""
+    """Buffer 大小（字节，推荐 1GB）"""
     
     kv_role: KVRole | None = None
-    """角色: kv_producer, kv_consumer, kv_both"""
+    """角色: kv_producer（生产）, kv_consumer（消费）, kv_both（兼有）"""
     
     kv_rank: int | None = None
-    """Rank: 0=Prefill, 1=Decode（目前仅支持 1P1D）"""
+    """Rank: 0=Prefill, 1=Decode（目前支持 1P1D）"""
     
     kv_parallel_size: int = 1
     """并行实例数（P2pNcclConnector 应为 2）"""
     
     kv_ip: str = "127.0.0.1"
-    """KV connector IP"""
+    """KV connector 通信 IP"""
     
     kv_port: int = 14579
-    """KV connector Port"""
+    """KV connector 通信端口"""
     
     kv_connector_extra_config: dict[str, Any] = {}
-    """额外配置"""
+    """Connector 额外配置（TP/DP size、layerwise 配置等）"""
+    
+    kv_connector_module_path: str | None = None
+    """KV connector 模块路径（仅 V1 支持动态加载）"""
     
     kv_load_failure_policy: Literal["recompute", "fail"] = "fail"
-    """KV 加载失败策略: recompute 或 fail"""
+    """KV 加载失败策略: recompute（重算）或 fail（直接失败）"""
 ```
 
 ---
@@ -396,11 +407,20 @@ python vllm-ascend/examples/offline_disaggregated_prefill_npu.py
 
 **测试脚本**:
 ```bash
-# Prefill 服务器
-python run_prefill.py --host=<prefill_ip> --port=30000
+# 容器部署模式（vLLM-Ascend 推荐）
+# Prefill 容器
+docker run -d --name vllm-p \
+  --device /dev/davinci0 \
+  ...
+  vllm-ascend:v0.20.2rc \
+  python3 /workspace/run_prefill.sh
 
-# Decode 服务器
-python run_decode.py --host=<decode_ip> --port=30100 --prefill_host=<prefill_ip>
+# Decode 容器  
+docker run -d --name vllm-d \
+  --device /dev/davinci1 \
+  ...
+  vllm-ascend:v0.20.2rc \
+  python3 /workspace/run_decode.sh
 ```
 
 ---
@@ -415,8 +435,8 @@ python run_decode.py --host=<decode_ip> --port=30100 --prefill_host=<prefill_ip>
 
 **测试脚本**:
 ```bash
-# 使用 Mooncake Proxy Server
-python Mooncake/mooncake-wheel/mooncake/vllm_v1_proxy_server.py \
+# 使用 Mooncake Proxy Server（vLLM-Ascend 使用）
+python3 /workspace/mooncake/vllm_v1_proxy_server.py \
   --prefill_hosts=<prefill1_ip>,<prefill2_ip> \
   --decode_host=<decode_ip>
 ```
@@ -469,7 +489,104 @@ ktc = KVTransferConfig(
 
 ---
 
-### 4.2 测试方法
+### 4.2 PD 分离容器部署模式
+
+PD 分离在 vLLM-Ascend 中通常通过 **Docker 容器** 部署，每个角色运行在独立的容器中。
+
+#### 部署配置示例
+
+```
+Prefill 容器: /dev/davinci0-1, TP=2
+  → 端口映射: 8000:8000 (API), 30000-30010 (KV Transfer)
+
+Decode 容器: /dev/davinci2-3, TP=2
+  → 端口映射: 8001:8000 (API), 30100-30110 (KV Transfer)
+```
+
+#### Prefill 容器启动
+
+```bash
+#!/bin/bash
+# run_prefill.sh
+
+vllm serve /path/to/model \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 2 \
+  --kv-transfer-config '{
+    "kv_connector": "MooncakeConnectorV1",
+    "kv_role": "kv_producer",
+    "kv_rank": 0,
+    "kv_port": 30000
+  }'
+```
+
+#### Decode 容器启动
+
+```bash
+#!/bin/bash
+# run_decode.sh
+
+vllm serve /path/to/model \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 2 \
+  --kv-transfer-config '{
+    "kv_connector": "MooncakeConnectorV1",
+    "kv_role": "kv_consumer",
+    "kv_rank": 1,
+    "kv_port": 30100
+  }'
+```
+
+#### 容器部署脚本
+
+```bash
+#!/bin/bash
+# deploy.sh
+
+# 1. 启动 Prefill 容器
+docker run -d --name vllm-p \
+  --device /dev/davinci0 \
+  --device /dev/davinci1 \
+  --net host \
+  -v /path/to/model:/model \
+  -v /path/to/run_prefill.sh:/workspace/run_prefill.sh \
+  vllm-ascend:v0.20.2rc \
+  bash /workspace/run_prefill.sh
+
+# 2. 等待 Prefill 就绪
+sleep 30
+
+# 3. 启动 Decode 容器
+docker run -d --name vllm-d \
+  --device /dev/davinci2 \
+  --device /dev/davinci3 \
+  --net host \
+  -v /path/to/model:/model \
+  -v /path/to/run_decode.sh:/workspace/run_decode.sh \
+  vllm-ascend:v0.20.2rc \
+  bash /workspace/run_decode.sh
+
+# 4. 确认服务状态
+docker logs vllm-p --tail 5
+docker logs vllm-d --tail 5
+```
+
+#### TP 异构模式
+
+Prefill 和 Decode 可以使用不同的 TP size：
+
+```
+Prefill: TP=2 （NPU 0-1）
+Decode: TP=4  （NPU 2-5）
+```
+
+这种配置适合 Prefill 计算量小、Decode 延迟要求高的场景。
+
+---
+
+### 4.3 测试方法
 
 #### **方法 1: 功能测试**
 
@@ -505,10 +622,10 @@ for i, output in enumerate(outputs):
 python vllm/benchmarks/disagg_benchmarks/disagg_prefill_proxy_server.py
 
 # Mooncake benchmark
-python Mooncake/benchmarks/xypd_benchmarks/proxy_demo.py
+python /workspace/mooncake/benchmarks/xypd_benchmarks/proxy_demo.py
 
 # HIXL bandwidth test
-python hixl/benchmarks/benchmark_bandwidth.py --schema=d2d --size=128M
+python /workspace/hixl/benchmarks/benchmark_bandwidth.py --schema=d2d --size=128M
 ```
 
 ---
@@ -524,7 +641,7 @@ python hixl/benchmarks/benchmark_bandwidth.py --schema=d2d --size=128M
 **测试脚本**:
 ```python
 # Mooncake stress test
-python Mooncake/mooncake-store/tests/stress_cluster_benchmark.py \
+python /workspace/mooncake/mooncake-store/tests/stress_cluster_benchmark.py \
   --num_requests=1000 \
   --max_seq_len=10000 \
   --kv_cache_size=10GB
@@ -561,25 +678,20 @@ except KVTransferError:
 
 ### 5.1 硬件支持
 
-#### **NVIDIA GPU 支持**
-
-| GPU | Prefill | Decode | KV Transfer | Connector | 说明 |
-|-----|---------|--------|------------|-----------|------|
-| **A100** | ✅ | ✅ | ✅ | P2pNcclConnector | NVLink/RDMA |
-| **H100** | ✅ | ✅ | ✅ | P2pNcclConnector/Mooncake | NVLink/RDMA/TCP |
-| **A6000** | ✅ | ✅ | ✅ | P2pNcclConnector | PCIe/RDMA |
-| **L40** | ✅ | ✅ | ✅ | P2pNcclConnector | PCIe |
-
----
-
 #### **Ascend NPU 支持**
 
 | NPU | Prefill | Decode | KV Transfer | Connector | 说明 |
 |-----|---------|--------|------------|-----------|------|
-| **Ascend 910B** | ✅ | ✅ | ✅ | MooncakeConnectorV1 | HCCS/RDMA |
+| **Ascend 910B** | ✅ | ✅ | ✅ | MooncakeConnectorV1 | HCCS/RDMA，当前主要测试平台 |
 | **Ascend 910-93** | ✅ | ✅ | ✅ | MooncakeConnectorV1 | HCCS/RDMA |
 | **Ascend 950 (A3)** | ✅ | ✅ | ✅ | MooncakeConnectorV1 | HCCS/RDMA/D2RH |
 | **Ascend 310P** | ✅ | ✅ | ⚠️ 有限 | MooncakeConnectorV1 | 需特殊配置 |
+
+#### **NVIDIA GPU 支持**
+
+| GPU | Prefill | Decode | KV Transfer | Connector |
+|-----|---------|--------|------------|-----------|
+| **A100** | ✅ | ✅ | ✅ | P2pNcclConnector |
 
 ---
 
@@ -630,11 +742,11 @@ ibv_devinfo
 ib_write_bw -d <device> -s 128M
 
 # HCCS 检查（Ascend）
-cat /usr/local/Ascend/latest/ Ascend-Ascend-INFO
+cat /usr/local/Ascend/latest/Ascend-Ascend-INFO
 # 检查 HCCS 链路状态
 
 # HCCS 性能测试（HIXL）
-python hixl/benchmarks/A3_benchmark_performance.py
+python /workspace/hixl/benchmarks/A3_benchmark_performance.py
 # 预期输出: 119 GB/s (HCCS D2D)
 ```
 
@@ -806,7 +918,6 @@ if __name__ == "__main__":
 
 ---
 
-**文档版本**: v1.0  
-**创建时间**: 2026-06-20  
-**基于源码**: vllm/vllm/distributed/kv_transfer/ + vllm-ascend/vllm_ascend/distributed/kv_transfer/ + Mooncake + HIXL  
-**维护者**: vLLM 项目分析团队
+**文档版本**: v2.0  
+**创建时间**: 2026-06-27  
+**基于实验**: PD 分离 4 卡测试（Qwen3-VL-32B, 2026-06-24）、2+2 卡性能测试（Qwen2-VL-7B, 2026-06-25）、异构 TP 基准测试（2026-06-25）
