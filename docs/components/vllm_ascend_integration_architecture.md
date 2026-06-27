@@ -91,7 +91,196 @@ def _ensure_global_patch():
 
 ## 3. Patch 应用机制
 
-### 3.1 分阶段 Patch
+### 3.1 核心原理
+
+Monkey Patch 的原理是 Python 的**运行时属性替换**：将上游 vLLM 模块中的函数/类/方法替换为 vLLM-Ascend 的 NPU 兼容实现。替换发生在**模块导入时**（顶层代码），而非运行时显式调用。
+
+```
+Python 模块导入流程
+    │
+    ├─ import vllm_ascend.patch.platform
+    │   └─ __init__.py 导入各 patch_*.py
+    │       └─ patch_*.py 执行顶层代码：
+    │           vllm.module.function = ascend_function
+    │
+    └─ 从此，所有对 vllm.module.function 的调用 → ascend_function
+```
+
+### 3.2 Patch 示例详解
+
+#### 示例1：最简单的 Patch — 重定向 torch.accelerator → torch.npu
+
+**上游 vLLM 的行为**：使用 `torch.accelerator.memory_stats()` 获取 GPU 内存统计。
+
+**NPU 的问题**：`torch.accelerator` 只适配了 CUDA，对 NPU 返回空值。
+
+**Patch 实现**：
+
+```python
+# vllm_ascend/patch/platform/patch_torch_accelerator.py
+
+import torch
+
+def patch_empty_cache() -> None:
+    torch.npu.empty_cache()
+
+# 逐个替换 torch.accelerator 的 API 为 torch.npu 等价函数
+torch.accelerator.empty_cache = patch_empty_cache
+torch.accelerator.memory_stats = torch.npu.memory_stats
+torch.accelerator.memory_reserved = torch.npu.memory_reserved
+torch.accelerator.reset_peak_memory_stats = torch.npu.reset_peak_memory_stats
+```
+
+**Patch 结果**：上游 vLLM 调用 `torch.accelerator.memory_stats()` 时，实际执行的是 `torch.npu.memory_stats()`，对 NPU 完全透明。
+
+---
+
+#### 示例2：替换方法 — Qwen3-VL 模型前向优化
+
+**上游 vLLM 的行为**：Qwen3-VL 的 Attention 前向在 GPU 上分步执行（QKV 投影 → split → QK-Norm → RoPE → Attention）。
+
+**NPU 的问题**：分步执行导致多次 kernel launch，在 NPU 上性能差。
+
+**Patch 实现**：
+
+```python
+# vllm_ascend/patch/worker/patch_qwen3vl.py
+
+def forward_with_split_qkv_rmsnorm_mrope(
+    self, positions: torch.Tensor, hidden_states: torch.Tensor
+):
+    # 1. QKV 投影（与原版一致）
+    qkv, _ = self.qkv_proj(hidden_states)
+
+    if isinstance(self.rotary_emb, AscendMRotaryEmbedding):
+        # 2. NPU 融合算子：QKV split + QK-Norm + RoPE 一步完成
+        q, k, v, _ = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(
+            qkv=qkv,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            cos_sin=cos_sin,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            mrope_section=self.rotary_emb.mrope_section,
+            is_interleaved=self.rotary_emb.mrope_interleaved,
+            rope_dim=self.rotary_emb.rotary_dim,
+        )
+    else:
+        # 回退到分步执行
+        q, k, v = qkv.split(...)
+        q_by_head = self.q_norm(q_by_head)
+        k_by_head = self.k_norm(k_by_head)
+        q, k = self.rotary_emb(positions, q, k)
+
+    # 3. Attention 计算 + 输出投影（与原版一致）
+    attn_output = self.attn(q, k, v)
+    output, _ = self.o_proj(attn_output)
+    return output
+
+# 用 NPU 优化版本替换上游的 forward 方法
+Qwen3Attention.forward = forward_with_split_qkv_rmsnorm_mrope
+Qwen3MoeAttention.forward = forward_with_split_qkv_rmsnorm_mrope
+```
+
+**Patch 结果**：Qwen3-VL 的 Attention 前向被替换为融合版本，在 NPU 上减少 3 次 kernel launch，QK-Norm 和 RoPE 合并到 Triton 算子中一次完成。
+
+---
+
+#### 示例3：覆盖函数 — KV Cache Block Size 适配
+
+**上游 vLLM 的行为**：`resolve_kv_cache_block_sizes()` 在多 KV cache group + CP（context parallelism）时返回错误。
+
+**NPU 的问题**：上游代码假设多个 block size 不能与 CP 共存（这是 CUDA 的限制），但 Ascend 支持这种组合。
+
+**Patch 实现**：
+
+```python
+# vllm_ascend/patch/platform/patch_kv_cache_utils.py
+
+import vllm.v1.core.kv_cache_utils
+
+# 保存原始函数引用
+_orig_resolve = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
+
+def _ascend_resolve(kv_cache_config, vllm_config):
+    cache_config = vllm_config.cache_config
+    dcp = vllm_config.parallel_config.decode_context_parallel_size
+    pcp = vllm_config.parallel_config.prefill_context_parallel_size
+    groups = kv_cache_config.kv_cache_groups
+
+    if len(groups) <= 1:
+        # 单 group → 走原始逻辑
+        bs = cache_config.block_size * dcp * pcp
+        return bs, bs
+
+    if dcp != 1 or pcp != 1:
+        # Ascend 支持多 group + CP：
+        # 计算所有 group block size 的 LCM × CP 因子
+        group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+        scheduler_block_size = math.lcm(*group_block_sizes) * dcp * pcp
+        return scheduler_block_size, scheduler_block_size
+
+    return _orig_resolve(kv_cache_config, vllm_config)
+
+# 替换上游函数
+vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve
+
+# 同时替换 engine/core.py 中直接 import 的引用
+import vllm.v1.engine.core
+vllm.v1.engine.core.resolve_kv_cache_block_sizes = _ascend_resolve
+```
+
+**Patch 结果**：DS V4 在 8 卡 CP 场景下可以正确计算 KV Cache block size，不会触发上游的 CP 限制断言。
+
+---
+
+#### 示例4：覆盖类方法 — Mamba 配置适配
+
+**上游 vLLM 的行为**：`HybridAttentionMambaModelConfig.verify_and_update_config()` 设置默认 block size。
+
+**NPU 的问题**：Ascend 硬件要求 cache tensor 连续，需要 attention block size 对齐到 kernel block size（128）的倍数。
+
+**Patch 实现**：
+
+```python
+# vllm_ascend/patch/platform/patch_mamba_config.py
+
+import vllm.model_executor.models.config
+
+@classmethod
+def verify_and_update_config(cls, vllm_config):
+    # 1. 先执行原始逻辑
+    MambaModelConfig.verify_and_update_config(vllm_config)
+
+    # 2. 计算 SSM block 和 attention block 的对齐
+    kernel_block_size = 128
+    ssm_block_page_size = max(mamba_sizes)
+
+    # 计算 attention block size 使其 page size ≥ ssm page size
+    attn_block_size = kernel_block_size * cdiv(
+        ssm_block_page_size,
+        kernel_block_size * attn_single_token_k_page_size,
+    )
+
+    # 3. 覆盖 block size 为对齐后的值
+    if cache_config.block_size is None or cache_config.block_size < attn_block_size:
+        cache_config.block_size = attn_block_size
+
+    # 4. padding mamba page 使其与 attention page 相等
+    cache_config.mamba_page_size_padded = attn_page_size + conv_block_page_size
+
+# 用 Ascend 版本替换类方法
+vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config = \
+    verify_and_update_config
+```
+
+**Patch 结果**：Mamba+Attention 混合模型在 NPU 上运行时，block size 自动对齐到 128 的倍数，确保 cache tensor 连续。
+
+---
+
+### 3.3 分阶段 Patch
 
 Patch 分为两个阶段应用：
 
