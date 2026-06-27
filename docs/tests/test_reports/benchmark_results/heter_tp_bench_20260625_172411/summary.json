@@ -1,0 +1,218 @@
+{
+  "timestamp": "20260625_172411",
+  "config": {
+    "prefill_npus": "2,3",
+    "prefill_tp": 2,
+    "decode_npus": "4,5,6,7",
+    "decode_tp": 4,
+    "model": "Qwen2-VL-7B-Instruct",
+    "kv_connector": "MooncakeLayerwiseConnector",
+    "pd_head_ratio": 2,
+    "proxy_url": "http://127.0.0.1:8000"
+  },
+  "scenarios": {
+    "short_prompt_20_short_output_20": {
+      "category": "short",
+      "mean_latency_ms": 490.0,
+      "min_latency_ms": 470,
+      "max_latency_ms": 522,
+      "p50_latency_ms": 485,
+      "p95_latency_ms": 522,
+      "avg_prompt_tokens": 21,
+      "avg_completion_tokens": 20,
+      "decode_throughput_tok_s": 40.8,
+      "num_samples": 5
+    },
+    "short_prompt_20_medium_output_128": {
+      "category": "short",
+      "mean_latency_ms": 2809.0,
+      "min_latency_ms": 2684,
+      "max_latency_ms": 2922,
+      "p50_latency_ms": 2768,
+      "p95_latency_ms": 2922,
+      "avg_prompt_tokens": 21,
+      "avg_completion_tokens": 128,
+      "decode_throughput_tok_s": 45.6,
+      "num_samples": 5
+    },
+    "short_prompt_20_long_output_256": {
+      "category": "short",
+      "mean_latency_ms": 5479.6,
+      "min_latency_ms": 5307,
+      "max_latency_ms": 5558,
+      "p50_latency_ms": 5513,
+      "p95_latency_ms": 5558,
+      "avg_prompt_tokens": 21,
+      "avg_completion_tokens": 256,
+      "decode_throughput_tok_s": 46.7,
+      "num_samples": 5
+    },
+    "medium_prompt_512_medium_output_128": {
+      "category": "medium",
+      "mean_latency_ms": 2759.6,
+      "min_latency_ms": 2669,
+      "max_latency_ms": 2818,
+      "p50_latency_ms": 2757,
+      "p95_latency_ms": 2818,
+      "avg_prompt_tokens": 511,
+      "avg_completion_tokens": 128,
+      "decode_throughput_tok_s": 46.4,
+      "num_samples": 5
+    },
+    "medium_prompt_512_long_output_256": {
+      "category": "medium",
+      "mean_latency_ms": 5533.2,
+      "min_latency_ms": 5494,
+      "max_latency_ms": 5597,
+      "p50_latency_ms": 5512,
+      "p95_latency_ms": 5597,
+      "avg_prompt_tokens": 511,
+      "avg_completion_tokens": 256,
+      "decode_throughput_tok_s": 46.3,
+      "num_samples": 5
+    },
+    "midlong_prompt_1024_medium_output_128": {
+      "category": "long",
+      "mean_latency_ms": 2789.4,
+      "min_latency_ms": 2717,
+      "max_latency_ms": 2866,
+      "p50_latency_ms": 2781,
+      "p95_latency_ms": 2866,
+      "avg_prompt_tokens": 1021,
+      "avg_completion_tokens": 128,
+      "decode_throughput_tok_s": 45.9,
+      "num_samples": 5
+    },
+    "midlong_prompt_1024_long_output_256": {
+      "category": "long",
+      "mean_latency_ms": 5538.2,
+      "min_latency_ms": 5487,
+      "max_latency_ms": 5573,
+      "p50_latency_ms": 5544,
+      "p95_latency_ms": 5573,
+      "avg_prompt_tokens": 1021,
+      "avg_completion_tokens": 256,
+      "decode_throughput_tok_s": 46.2,
+      "num_samples": 5
+    },
+    "long_prompt_2048_medium_output_128": {
+      "category": "long",
+      "mean_latency_ms": 2779.4,
+      "min_latency_ms": 2712,
+      "max_latency_ms": 2826,
+      "p50_latency_ms": 2778,
+      "p95_latency_ms": 2826,
+      "avg_prompt_tokens": 2041,
+      "avg_completion_tokens": 128,
+      "decode_throughput_tok_s": 46.1,
+      "num_samples": 5
+    },
+    "long_prompt_2048_long_output_256": {
+      "category": "long",
+      "mean_latency_ms": 5435.6,
+      "min_latency_ms": 5324,
+      "max_latency_ms": 5534,
+      "p50_latency_ms": 5450,
+      "p95_latency_ms": 5534,
+      "avg_prompt_tokens": 2041,
+      "avg_completion_tokens": 256,
+      "decode_throughput_tok_s": 47.1,
+      "num_samples": 5
+    },
+    "xlong_prompt_4096_medium_output_128": {
+      "category": "xlong",
+      "mean_latency_ms": 174.6,
+      "min_latency_ms": 141,
+      "max_latency_ms": 293,
+      "p50_latency_ms": 145,
+      "p95_latency_ms": 293,
+      "avg_prompt_tokens": 0,
+      "avg_completion_tokens": 0,
+      "decode_throughput_tok_s": 0,
+      "num_samples": 5
+    },
+    "xlong_prompt_4096_long_output_256": {
+      "category": "xlong",
+      "mean_latency_ms": 144.8,
+      "min_latency_ms": 142,
+      "max_latency_ms": 149,
+      "p50_latency_ms": 144,
+      "p95_latency_ms": 149,
+      "avg_prompt_tokens": 0,
+      "avg_completion_tokens": 0,
+      "decode_throughput_tok_s": 0,
+      "num_samples": 5
+    },
+    "throughput_output_50": {
+      "category": "throughput",
+      "mean_latency_ms": 1103.2,
+      "min_latency_ms": 1073,
+      "max_latency_ms": 1120,
+      "p50_latency_ms": 1108,
+      "p95_latency_ms": 1120,
+      "avg_prompt_tokens": 21,
+      "avg_completion_tokens": 50,
+      "decode_throughput_tok_s": 45.3,
+      "num_samples": 5
+    },
+    "throughput_output_100": {
+      "category": "throughput",
+      "mean_latency_ms": 2128.6,
+      "min_latency_ms": 2088,
+      "max_latency_ms": 2175,
+      "p50_latency_ms": 2116,
+      "p95_latency_ms": 2175,
+      "avg_prompt_tokens": 21,
+      "avg_completion_tokens": 100,
+      "decode_throughput_tok_s": 47.0,
+      "num_samples": 5
+    },
+    "throughput_output_200": {
+      "category": "throughput",
+      "mean_latency_ms": 4221.0,
+      "min_latency_ms": 4148,
+      "max_latency_ms": 4274,
+      "p50_latency_ms": 4253,
+      "p95_latency_ms": 4274,
+      "avg_prompt_tokens": 21,
+      "avg_completion_tokens": 200,
+      "decode_throughput_tok_s": 47.4,
+      "num_samples": 5
+    }
+  },
+  "concurrent": {
+    "concurrent_1": {
+      "concurrency": 1,
+      "wall_time_ms": 1126,
+      "success_count": 1,
+      "total_completion_tokens": 50,
+      "total_prompt_tokens": 21,
+      "throughput_tok_s": 44.4
+    },
+    "concurrent_4": {
+      "concurrency": 4,
+      "wall_time_ms": 6870,
+      "success_count": 4,
+      "total_completion_tokens": 200,
+      "total_prompt_tokens": 84,
+      "throughput_tok_s": 29.11
+    },
+    "concurrent_8": {
+      "concurrency": 8,
+      "wall_time_ms": 1428,
+      "success_count": 8,
+      "total_completion_tokens": 400,
+      "total_prompt_tokens": 168,
+      "throughput_tok_s": 280.11
+    },
+    "concurrent_16": {
+      "concurrency": 16,
+      "wall_time_ms": 4005,
+      "success_count": 16,
+      "total_completion_tokens": 800,
+      "total_prompt_tokens": 336,
+      "throughput_tok_s": 199.75
+    }
+  },
+  "cold_start_ms": 6014
+}

@@ -111,32 +111,138 @@ PD分离架构:
 @config
 class KVTransferConfig:
     """KV Cache传输配置"""
-
-    kv_connector: str | None = None
-    """KV连接器类型：
-    - 'MooncakeConnector': 使用Mooncake传输
-    - 'NIXLConnector': 使用NIXL传输
-    - 'P2pNcclConnector': 使用NCCL P2P传输
-    - 'LMCacheConnector': 使用LMCache
-    """
-
-    kv_role: KVRole | None = None
-    """实例角色：
-    - 'kv_producer': Prefill实例，生产KV Cache
-    - 'kv_consumer': Decode实例，消费KV Cache
-    - 'kv_both': 混合模式，既生产也消费
-    """
-
-    kv_rank: int | None = None
-    """实例排名：0=Prefill，1=Decode"""
-
-    kv_parallel_size: int = 1
-    """并行实例数量（P2pNccl需要2）"""
-
-    kv_ip: str = "127.0.0.1"
-    kv_port: int = 14579
-    """KV连接器IP和端口"""
 ```
+
+#### 3.1.1 基础参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `kv_connector` | `str \| None` | `None` | KV连接器类型。决定后端传输引擎：`MooncakeConnectorV1`, `MooncakeLayerwiseConnector`, `NIXLConnector`, `P2pNcclConnector`, `LMCacheConnector` 等 |
+| `kv_role` | `KVRole \| None` | `None` | 实例角色：`kv_producer` (Prefill, 生产KV Cache), `kv_consumer` (Decode, 消费KV Cache), `kv_both` (混合模式) |
+| `kv_rank` | `int \| None` | `None` | 实例排名：`0`=Prefill, `1`=Decode。用于在多个KV Transfer实例中标识自身 |
+| `kv_parallel_size` | `int` | `1` | 并行KV传输实例数。P2P模式需要设置为2（表示有1个Producer+1个Consumer） |
+
+#### 3.1.2 网络参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `kv_ip` | `str` | `"127.0.0.1"` | KV连接器IP地址。同节点PD分离用 `127.0.0.1`（本地回环），跨节点用实际网卡IP |
+| `kv_port` | `int` | `14579` | KV连接器端口。同节点PD分离时，Prefill和Decode节点使用不同的端口（如 `20001` / `20002`） |
+
+#### 3.1.3 设备与缓存参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `kv_buffer_device` | `str` | 自动检测 | KV Connector缓冲设备：`npu` (Ascend), `cuda` (NVIDIA), `cpu`。Ascend上建议设为 `npu` 避免NPU↔CPU拷贝 |
+| `kv_buffer_size` | `float` | `1e9` (≈1GB) | KV缓冲大小（字节）。主要用于 TorchDistributedConnector，实际传输量超过此值时会有性能影响 |
+| `kv_connector_extra_config` | `dict[str, Any]` | `{}` | Connector专用拓展配置，详见 3.1.5 节 |
+
+#### 3.1.4 高级参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `engine_id` | `str \| None` | 自动生成UUID | 引擎实例唯一ID。用于KV传输引擎标识。若未设置会在启动时自动生成为UUID |
+| `kv_connector_module_path` | `str \| None` | `None` | 自定义Connector的Python模块路径。用于从外部模块动态加载KV Connector（仅V1引擎支持） |
+| `enable_permute_local_kv` | `bool` | `False` | 实验性功能：启用 HND → NHD 的KV缓存布局转换。用于某些需要特定内存布局的Connector |
+| `kv_load_failure_policy` | `Literal["recompute", "fail"]` | `"fail"` | KV Cache加载失败的处理策略。`"recompute"`: 重新调度请求重新计算失败block；`"fail"`: 立即以失败finish_reason结束请求 |
+
+#### 3.1.5 `kv_connector_extra_config` 详解
+
+`kv_connector_extra_config` 是传递给底层 Connector 的拓展字典，不同 Connector 会从中读取不同的字段。
+
+##### MooncakeConnectorV1 / MooncakeLayerwiseConnector (Ascend) 通用字段
+
+```json
+{
+  "prefill": {
+    "dp_size": 1,      // Prefill节点的Data Parallel大小
+    "tp_size": 2       // Prefill节点的Tensor Parallel大小
+  },
+  "decode": {
+    "dp_size": 1,      // Decode节点的Data Parallel大小
+    "tp_size": 2       // Decode节点的Tensor Parallel大小
+  }
+}
+```
+
+##### MooncakeLayerwiseConnector 附加字段（等同构TP映射）
+
+上述 `prefill` 和 `decode` 块的 `tp_size` 会被 `ascend_config.py` 读取，自动计算出：
+
+```python
+# ascend_config.py:186-203
+pd_tp_ratio = prefill_tp_size // decode_tp_size   # tensor parallel 比
+if pd_tp_ratio > 1:
+    pd_head_ratio = prefill_tp_size // decode_tp_size  # head 重映射比
+    num_head_replica = prefill_tp_size // num_kv_head  # head 副本数
+```
+
+**注意**：`pd_head_ratio` 不能直接在 `kv-transfer-config` JSON 中填写（vLLM 0.20.2 中 `KVTransferConfig` 不接受未知字段），而是由 `AscendConfig` 自动从 `prefill.tp_size` 和 `decode.tp_size` 推导。
+
+##### MooncakeConnector (Ascend P2P) 附加字段
+
+```json
+{
+  "prefill": {
+    "dp_size": 1,
+    "tp_size": 2,
+    "pp_size": 1,                   // Pipeline Parallel大小（可选，默认1）
+    "pp_layer_partition": null      // PP层划分（可选）
+  },
+  "decode": {
+    "dp_size": 1,
+    "tp_size": 2,
+    "pp_size": 1
+  }
+}
+```
+
+#### 3.1.6 完整配置示例
+
+**同构TP配置 (Prefill TP=2, Decode TP=2) — MooncakeConnectorV1：**
+
+```bash
+--kv-transfer-config '{
+  "kv_connector": "MooncakeConnectorV1",
+  "kv_buffer_device": "npu",
+  "kv_role": "kv_producer",          # 或 "kv_consumer"
+  "kv_parallel_size": 1,
+  "kv_port": "20001",                # Prefill用20001, Decode用20002
+  "engine_id": "0",                  # Prefill=0, Decode=1
+  "kv_rank": 0,                      # Prefill=0, Decode=1
+  "kv_connector_extra_config": {
+    "prefill": { "dp_size": 1, "tp_size": 2 },
+    "decode": { "dp_size": 1, "tp_size": 2 }
+  }
+}'
+```
+
+**异构TP配置 (Prefill TP=4, Decode TP=2, pd_head_ratio=2) — MooncakeLayerwiseConnector：**
+
+```bash
+--kv-transfer-config '{
+  "kv_connector": "MooncakeLayerwiseConnector",
+  "kv_buffer_device": "npu",
+  "kv_role": "kv_producer",          # 或 "kv_consumer"
+  "kv_parallel_size": 1,
+  "kv_port": "20001",                # Prefill用20001, Decode用20002
+  "engine_id": "0",                  # Prefill=0, Decode=1
+  "kv_rank": 0,                      # Prefill=0, Decode=1
+  "kv_connector_extra_config": {
+    "prefill": { "dp_size": 1, "tp_size": 4 },
+    "decode": { "dp_size": 1, "tp_size": 2 }
+  }
+}'
+# 注意: pd_head_ratio=2 由 ascend_config.py 自动计算，无需手动传入
+```
+
+#### 3.1.7 参数约束与注意事项
+
+1. **`kv_role` 必须与 `kv_connector` 同时设置**：两者成对出现，缺一不可
+2. **`kv_connector` 与 `kv_connector_module_path` 互斥**：模块方式提供时无需再指定名称
+3. **`kv_connector_extra_config` 中的 tp_size 映射**：在 Ascend 上需保证 `prefill_tp_size % decode_tp_size == 0`（即 Prefill TP >= Decode TP），否则启动时断言失败
+4. **`kv_port` 需不冲突**：同节点部署时 Prefill 和 Decode 使用不同端口
+5. **`engine_id` 自动生成**: 若未设置，启动时自动生成 UUID；建议在同构配置中显式设置以保持一致性
 
 ### 3.2 KV Connector架构
 
@@ -1298,6 +1404,189 @@ curl http://192.168.1.10:9000/v1/completions \
 
 ---
 
-*文档版本：v1.0*
-*创建日期：2026-06-20*
+## 12. KV Connector 架构对比：NVIDIA vs Ascend
+
+### 12.1 架构总览
+
+| 维度 | NVIDIA (vLLM Core) | Ascend (vLLM-Ascend) |
+|------|-------------------|----------------------|
+| Connector 类型数 | **8+** (Mooncake/NIXL/P2P-NCCL/LMCache/HF3FS/Moriio/Offloading/Example) | **6** (MooncakeP2P/MooncakeLayerwise/MooncakeHybrid/UCM/LMCache/CPUOffload) |
+| 传输后端 | NIXL, Mooncake, P2P NCCL, LMCache, HF3FS | Mooncake Transfer Engine (封装HIXL) |
+| 传输模式 | **Push + Pull 双模式** | **仅 Push 模式** (Producer-Driven) |
+| 异步传输 | 独立 writer 线程 + Event 驱动 | 独立 Send/Recv 线程 |
+| KV 缓存布局 | HND (head-num-dim) 自动适配 | NZ (narrow-zero) + HND 混用 |
+| 异构 TP 支持 | `pd_head_ratio` 在 NIXL 中实现 | `pd_head_ratio` + `num_head_replica` 在 LayerwiseConnector |
+| 代码量 | ~1800 行 (Mooncake) + ~4000 行 (NIXL Push+Pull) | ~1900 行 (Mooncake) + ~2000 行 (Layerwise) |
+
+### 12.2 Connector 代码规模对比
+
+```
+NVIDIA (vLLM Core)                              Ascend (vLLM-Ascend)
+─────────────────────────                        ─────────────────────────
+mooncake/                                         kv_p2p/
+├── mooncake_connector.py    1795 lines           ├── mooncake_connector.py            1883 lines
+├── mooncake_utils.py         126 lines           ├── mooncake_layerwise_connector.py   1988 lines
+                                                  ├── mooncake_hybrid_connector.py      1888 lines
+nixl/                                             kv_pool/
+├── connector.py               283 lines           ├── ascend_store/
+├── base_scheduler.py           -                      ├── ascend_store_connector.py   303 lines
+├── base_worker.py              -                      ├── pool_worker.py             1039 lines
+├── pull_scheduler.py           -                      ├── pool_scheduler.py           597 lines
+├── pull_worker.py            382 lines                ├── config_data.py             736 lines
+├── push_scheduler.py           -                      ├── kv_transfer.py             569 lines
+├── push_worker.py            742 lines                └── backend/
+├── metadata.py               196 lines                    ├── mooncake_backend.py    278 lines
+├── scheduler.py              504 lines                    ├── memcache_backend.py    132 lines
+├── worker.py                   1 line                     └── yuanrong_backend.py    191 lines
+├── stats.py                  264 lines               ├── cpu_offload/
+├── utils.py                   48 lines                   ├── cpu_offload_connector.py 448 lines
+├── tp_mapping.py               -                         ├── metadata.py             257 lines
+                                                          └── cpu_kv_cache_manager.py 179 lines
+p2p/                                              utils/
+├── p2p_nccl_connector.py     531 lines             ├── mooncake_transfer_engine.py     43 lines
+├── p2p_nccl_engine.py        632 lines             └── utils.py                      302 lines
+├── tensor_memory_pool.py     273 lines
+```
+
+### 12.3 关键架构差异
+
+#### 12.3.1 Push vs Pull 传输模式
+
+| | Push (Ascend 当前唯一) | Pull (NVIDIA NIXL) | Push (NVIDIA NIXL) |
+|---|---|---|---|
+| 方向 | P 侧主动写入 → D 侧接收 | D 侧主动读取 → P 侧发送 | P 侧主动写入 → D 侧接收 |
+| 调度 | P 侧决定传输时机 | D 侧决定何时拉取 | P 侧 writer 线程管理 |
+| 背压控制 | 无天然背压，P 侧需感知 D 侧状态 | 天然支持（D 侧拉得慢就排队） | 事件驱动，writer 自轮询 |
+| 复杂度 | 中等 | 低 | 高 |
+
+```python
+# Ascend 当前实现 (Push Only): mooncake_layerwise_connector.py:483
+ret = self.engine.batch_transfer_sync_write(
+    session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
+)
+
+# NVIDIA NIXL (Push + Pull 双模式): pull_worker.py / push_worker.py
+class NixlPushConnector(NixlBaseConnector):  # P-side主动
+class NixlPullConnector(NixlBaseConnector):   # D-side主动
+```
+
+**优化空间**：Ascend 当前**仅支持 Push 模式**。Pull 模式在 Decode 侧负载高时有天然背压机制，可防止 Prefill 过度推送导致 Decode OOM。
+
+#### 12.3.2 内存管理
+
+**NVIDIA (NIXL Push Worker)** — 完整队列生命周期管理：
+
+```python
+# push_worker.py
+class NixlPushConnectorWorker:
+    def __init__(self, ...):
+        # 注册队列：等待 Decode 端就绪
+        self._pending_d_registrations: queue.Queue = queue.Queue()
+        # 正在传输中
+        self._sending_transfers: dict = {}
+        # 传输完成等待清理
+        self._push_finished_blocks: dict = {}
+        # 事件驱动唤醒（空闲时阻塞）
+        self._push_writer_wake = threading.Event()
+```
+
+**Ascend (Mooncake Transfer Engine Wrapper)** — 简单一次性注册：
+
+```python
+# mooncake_transfer_engine.py
+class GlobalTE:
+    def __init__(self):
+        self.is_register_buffer: bool = False
+
+    def register_buffer(self, ptrs, sizes):
+        if self.is_register_buffer:
+            return  # 只注册一次，永不重试
+        for ptr, size in zip(ptrs, sizes):
+            self.transfer_engine.register_memory(ptr, size)
+        self.is_register_buffer = True
+```
+
+**问题**：`GlobalTE` 是**全局有状态单例**，`register_buffer` 标记为 `True` 后就不再重新注册。如果内存地址变更（如 KV Cache 扩容、block 重分配），不会重新注册。NVIDIA 的 NIXL 有完整的 pending/completion/evict 生命周期管理。
+
+#### 12.3.3 异步与流水线
+
+**NVIDIA NIXL Push Worker** 设计：
+- 独立 `nixl-push-writer` 后台线程，事件驱动（`threading.Event`）
+- 空闲时阻塞等待，有任务时自动轮询 NIXL notif
+- 计算与传输可流水线重叠
+
+**Ascend Layerwise SendingThread**：
+```python
+# mooncake_layerwise_connector.py:263-268
+class KVCacheSendingLayerThread(threading.Thread):
+    def run(self):
+        # 有独立线程，但：
+        # 1. pd_head_ratio>1 时需要 resharding_stream.synchronize()
+        # 2. batch_transfer_sync_write 是同步调用，阻塞发送线程
+```
+
+**优化空间**：
+- `batch_transfer_sync_write` 是**同步**调用，会阻塞发送线程，无法做计算-传输重叠
+- `resharding_stream.synchronize()` 在异构 TP 下增加额外同步开销
+- 可改为异步传输 + callback 模式
+
+#### 12.3.4 异构 TP (pd_head_ratio) 实现
+
+**Ascend LayerwiseConnector** 在异构 TP 下通过 `resharding_stream` 做 head 重排：
+
+```python
+# mooncake_layerwise_connector.py:438-478
+if self.pd_head_ratio > 1:
+    # 额外步骤: view → copy → synchronize
+    with npu_stream_switch(self.resharding_stream):
+        key = key.view(-1, key.shape[-1])
+        self.k_buffer[:key.shape[0]].copy_(key)    # 额外的 NPU copy
+    self.resharding_stream.synchronize()             # stream 同步等待
+```
+
+NVIDIA 通过 `get_required_kvcache_layout()` 在引擎初始化时固定 `HND` 布局规避了这个问题，无需运行时额外 copy。
+
+#### 12.3.5 Proxy 负载均衡
+
+当前 Ascend Proxy（`load_balance_proxy_server_example.py`）使用简单数值优先级选路：
+
+```python
+def _update_prefiller_priority(self, server_idx):
+    priority = server.active_tokens + server.active_kv_cache * 0.3
+    heapq.heappush(self.prefiller_heap, (priority, server_idx, server))
+```
+
+**优化方向**：
+- **Prefix 缓存感知调度**：选择缓存了相同 prefix 的 Prefiller，提高 Cache Hit Rate
+- **亲和性调度**：同一 session 的请求路由到同一组 P/D，减少冷启动
+- **批量感知**：将同 batch size 的请求聚合到同一 Prefiller
+
+### 12.4 可改进方向汇总
+
+| 优先级 | 方向 | 当前状态 | 预期收益 |
+|--------|------|----------|----------|
+| **P0** | `pd_head_ratio` 断言限制 | `ascend_config.py` 断言 `prefill_tp % decode_tp == 0`，只支持 Prefill >= Decode | 解锁 Decode TP > Prefill TP 场景 |
+| **P0** | `remote_cached_tokens` KeyError | kv_producer 首次调度时 `params` 缺少此键，`MooncakeLayerwiseConnector` 崩溃 | 修复后 LayerwiseConnector 在异构 TP 下可用 |
+| **P1** | 异步传输 | 当前 `batch_transfer_sync_write` 是同步调用 | 计算-传输流水线重叠，降低端到端延迟 |
+| **P1** | `GlobalTE` 重构为非单例 + 重试机制 | 一次性注册永不重试 | 支持动态 KV Cache 扩容和地址变更 |
+| **P2** | Pull 模式支持 | 当前只有 Push | 背压控制，防止 D 侧过载 |
+| **P2** | KV 布局统一 (HND vs NZ) | 混用，需要额外 copy/convert | 消除异构 TP 下的额外拷贝开销 |
+| **P3** | 缓存感知 Proxy 调度 | 纯轮询 + active_token 优先级 | 提高 Prefix Cache 命中率 45%→70%+ |
+
+### 12.5 架构演进建议
+
+```
+短期 (P0) ─── 修复Bug + 放宽断言
+    │
+    ▼
+中期 (P1) ─── 异步传输 + GlobalTE 重构
+    │
+    ▼
+长期 (P2-P3) ─ Pull模式 + 统一KV布局 + 智能Proxy
+```
+
+---
+
+*文档版本：v1.1*
+*创建日期：2026-06-25*
 *基于vLLM、vLLM-Ascend、Mooncake、HIXL源码分析*

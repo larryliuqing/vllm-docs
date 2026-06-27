@@ -19,7 +19,7 @@
 
 ---
 
-### 2. [vLLM-Ascend 算子集成架构详解](vllm_ascend_operator_integration_arch.md) ⭐ 新增（精简版）
+### 2. [vLLM-Ascend 算子集成架构详解](vllm_ascend_operator_integration_arch.md)
 **文件大小**: 13KB | **创建时间**: 2026-06-20
 
 **核心内容**:
@@ -71,7 +71,7 @@
 
 ---
 
-### 6. [PD分离测试场景分析](PD_Separation_Test_Scenarios.md) ⭐ 新增（配套文档）
+### 6. [PD分离测试场景分析](PD_Separation_Test_Scenarios.md)
 **文件大小**: 103KB+ | **创建时间**: 2026-06-20
 
 **核心内容**:
@@ -84,7 +84,7 @@
 
 ---
 
-### 7. [PD分离测试成功报告](PD_TEST_SUCCESS.md) ⭐ 新增
+### 7. [PD分离测试成功报告](PD_TEST_SUCCESS.md)
 **文件大小**: 15KB+ | **创建时间**: 2026-06-20
 
 **核心内容**:
@@ -97,7 +97,30 @@
 
 ---
 
-### 8. [GPU Model Runner Load Model 详细流程](gpu_model_runner_load_model_detailed.md)
+### 8. [PD分离优化分析报告](PD分离优化分析报告.md)
+**文件大小**: ~50KB | **创建时间**: 2026-06-27
+
+**核心内容**:
+- PD分离优化方案分析
+- 性能瓶颈识别
+- 优化建议
+
+**适用人群**: 性能优化工程师
+
+---
+
+### 9. [PD分离源码深度分析](PD分离源码深度分析.md)
+**文件大小**: ~50KB | **创建时间**: 2026-06-27
+
+**核心内容**:
+- PD分离源码深度剖析
+- 关键代码路径追踪
+
+**适用人群**: 核心开发者
+
+---
+
+### 10. [GPU Model Runner Load Model 详细流程](gpu_model_runner_load_model_detailed.md)
 **文件大小**: 17KB | **创建时间**: 2026-06-14
 
 **核心内容**:
@@ -110,7 +133,7 @@
 
 ---
 
-### 9. [KVTransfer Workflow](kvtransfer_workflow.md)
+### 11. [KVTransfer Workflow](kvtransfer_workflow.md)
 **文件大小**: 20KB | **创建时间**: 2026-06-13
 
 **核心内容**:
@@ -122,7 +145,7 @@
 
 ---
 
-### 10. [vLLM CPU Model Loading Flow](vllm_cpu_model_loading_flow.md)
+### 12. [vLLM CPU Model Loading Flow](vllm_cpu_model_loading_flow.md)
 **文件大小**: 13KB | **创建时间**: 2026-06-13
 
 **核心内容**:
@@ -134,11 +157,22 @@
 
 ---
 
+### 13. [vLLM 源码安装与启动指南](vllm_source_install_guide.md)
+**文件大小**: 4KB | **创建时间**: 2026-06-14
+
+**核心内容**:
+- 源码安装步骤
+- 环境配置
+- 服务启动方法
+
+**适用人群**: 新入职开发者
+
+---
+
 ## 📊 统计信息
 
-- **文档总数**: 10 个
-- **总行数**: ~7,200 行
-- **覆盖组件**: 算子、模型适配、PD分离、Model Runner、KV Transfer、CPU Loading
+- **文档总数**: 13 个
+- **覆盖组件**: 算子、模型适配、PD分离（架构/分析/源码）、Model Runner、KV Transfer、CPU Loading、安装指南
 
 ---
 

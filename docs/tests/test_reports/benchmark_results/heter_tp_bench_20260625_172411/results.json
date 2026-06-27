@@ -1,0 +1,207 @@
+{
+  "scenarios": {
+    "short_prompt_20_short_output_20": {
+      "category": "short",
+      "latencies_ms": [
+        522,
+        489,
+        484,
+        470,
+        485
+      ],
+      "avg_prompt_tokens": 21,
+      "avg_completion_tokens": 20
+    },
+    "short_prompt_20_medium_output_128": {
+      "category": "short",
+      "latencies_ms": [
+        2768,
+        2764,
+        2922,
+        2907,
+        2684
+      ],
+      "avg_prompt_tokens": 21,
+      "avg_completion_tokens": 128
+    },
+    "short_prompt_20_long_output_256": {
+      "category": "short",
+      "latencies_ms": [
+        5518,
+        5558,
+        5502,
+        5307,
+        5513
+      ],
+      "avg_prompt_tokens": 21,
+      "avg_completion_tokens": 256
+    },
+    "medium_prompt_512_medium_output_128": {
+      "category": "medium",
+      "latencies_ms": [
+        2799,
+        2757,
+        2669,
+        2755,
+        2818
+      ],
+      "avg_prompt_tokens": 511,
+      "avg_completion_tokens": 128
+    },
+    "medium_prompt_512_long_output_256": {
+      "category": "medium",
+      "latencies_ms": [
+        5512,
+        5597,
+        5494,
+        5497,
+        5566
+      ],
+      "avg_prompt_tokens": 511,
+      "avg_completion_tokens": 256
+    },
+    "midlong_prompt_1024_medium_output_128": {
+      "category": "long",
+      "latencies_ms": [
+        2866,
+        2717,
+        2774,
+        2809,
+        2781
+      ],
+      "avg_prompt_tokens": 1021,
+      "avg_completion_tokens": 128
+    },
+    "midlong_prompt_1024_long_output_256": {
+      "category": "long",
+      "latencies_ms": [
+        5544,
+        5531,
+        5573,
+        5556,
+        5487
+      ],
+      "avg_prompt_tokens": 1021,
+      "avg_completion_tokens": 256
+    },
+    "long_prompt_2048_medium_output_128": {
+      "category": "long",
+      "latencies_ms": [
+        2826,
+        2712,
+        2810,
+        2778,
+        2771
+      ],
+      "avg_prompt_tokens": 2041,
+      "avg_completion_tokens": 128
+    },
+    "long_prompt_2048_long_output_256": {
+      "category": "long",
+      "latencies_ms": [
+        5534,
+        5463,
+        5324,
+        5450,
+        5407
+      ],
+      "avg_prompt_tokens": 2041,
+      "avg_completion_tokens": 256
+    },
+    "xlong_prompt_4096_medium_output_128": {
+      "category": "xlong",
+      "latencies_ms": [
+        293,
+        145,
+        145,
+        141,
+        149
+      ],
+      "avg_prompt_tokens": 0,
+      "avg_completion_tokens": 0
+    },
+    "xlong_prompt_4096_long_output_256": {
+      "category": "xlong",
+      "latencies_ms": [
+        149,
+        145,
+        144,
+        144,
+        142
+      ],
+      "avg_prompt_tokens": 0,
+      "avg_completion_tokens": 0
+    },
+    "throughput_output_50": {
+      "category": "throughput",
+      "latencies_ms": [
+        1120,
+        1073,
+        1108,
+        1110,
+        1105
+      ],
+      "avg_prompt_tokens": 21,
+      "avg_completion_tokens": 50
+    },
+    "throughput_output_100": {
+      "category": "throughput",
+      "latencies_ms": [
+        2088,
+        2116,
+        2108,
+        2175,
+        2156
+      ],
+      "avg_prompt_tokens": 21,
+      "avg_completion_tokens": 100
+    },
+    "throughput_output_200": {
+      "category": "throughput",
+      "latencies_ms": [
+        4172,
+        4274,
+        4148,
+        4253,
+        4258
+      ],
+      "avg_prompt_tokens": 21,
+      "avg_completion_tokens": 200
+    }
+  },
+  "concurrent": {
+    "concurrent_1": {
+      "concurrency": 1,
+      "wall_time_ms": 1126,
+      "success_count": 1,
+      "total_completion_tokens": 50,
+      "total_prompt_tokens": 21,
+      "throughput_tok_s": 44.4
+    },
+    "concurrent_4": {
+      "concurrency": 4,
+      "wall_time_ms": 6870,
+      "success_count": 4,
+      "total_completion_tokens": 200,
+      "total_prompt_tokens": 84,
+      "throughput_tok_s": 29.11
+    },
+    "concurrent_8": {
+      "concurrency": 8,
+      "wall_time_ms": 1428,
+      "success_count": 8,
+      "total_completion_tokens": 400,
+      "total_prompt_tokens": 168,
+      "throughput_tok_s": 280.11
+    },
+    "concurrent_16": {
+      "concurrency": 16,
+      "wall_time_ms": 4005,
+      "success_count": 16,
+      "total_completion_tokens": 800,
+      "total_prompt_tokens": 336,
+      "throughput_tok_s": 199.75
+    }
+  },
+  "throughput": {}
+}
