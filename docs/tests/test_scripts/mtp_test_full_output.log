@@ -1,0 +1,21 @@
+can not use command: npu-smi info
+can not use command: npu-smi info
+/root/run_mtp_docker.sh: line 2: cd: /vllm-ascend: No such file or directory
+can not use command: npu-smi info
+INFO 06-29 03:36:04 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 06-29 03:36:04 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 06-29 03:36:04 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 06-29 03:36:04 [__init__.py:238] Platform plugin ascend is activated
+2026-06-29 03:36:15,088 - 179 - ServiceProfiler - INFO - VLLM_USE_V1 not set, auto-detected via vLLM 0.20.2+empty: default 1
+
+============================================================
+测试: num_speculative_tokens = 1
+============================================================
+INFO 06-29 03:36:16 [nixl_utils.py:20] Setting UCX_RCACHE_MAX_UNRELEASED to '1024' to avoid a rare memory leak in UCX when using NIXL.
+WARNING 06-29 03:36:16 [nixl_utils.py:34] NIXL is not available
+WARNING 06-29 03:36:16 [nixl_utils.py:44] NIXL agent config is not available
+WARNING 06-29 03:36:16 [registry.py:945] Model architecture DeepseekV4ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v4:AscendDeepseekV4ForCausalLM.
+WARNING 06-29 03:36:16 [registry.py:945] Model architecture DeepSeekV4MTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v4_mtp:DeepSeekV4MTP.
+INFO 06-29 03:36:17 [__init__.py:110] Registered model loader `<class 'vllm_ascend.model_loader.netloader.netloader.ModelNetLoaderElastic'>` with load format `netloader`
+INFO 06-29 03:36:17 [__init__.py:110] Registered model loader `<class 'vllm_ascend.model_loader.rfork.rfork_loader.RForkModelLoader'>` with load format `rfork`
+INFO 06-29 03:36:17 [utils.py:233] non-default args: {'tokenizer_mode': 'ds_v4', 'trust_remote_code': True, 'safetensors_load_strategy': 'prefetch', 'max_model_len': 8192, 'tensor_parallel_size': 8, 'enable_expert_parallel': True, 'block_size': 128, 'enable_prefix_caching': True, 'gpu_memory_utilization': 0.95, 'max_num_batched_tokens': 10240, 'max_num_seqs': 64, 'quantization': 'ascend', 'speculative_config': {'num_speculative_tokens': 1, 'method': 'mtp', 'enforce_eager': True}, 'model': '/home/la/work/vllm-project/models/DeepSeek-V4-Flash-w4a8-mtp'}

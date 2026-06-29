@@ -15,6 +15,7 @@
 3. **Accept/Reject**: 根据验证结果接受或拒绝候选 token
 
 **核心价值**：
+
 - **降低延迟**: 通过并行验证减少推理轮次
 - **提升吞吐**: 减少目标模型的计算次数
 - **降低成本**: 减少昂贵的模型推理调用
@@ -25,19 +26,21 @@
 |------|-------|------------|---------|---------|------|
 | **Ngram** | `NgramProposer` | ❌ 无需模型 | Token IDs | 重复文本场景 | 基于 N-gram 匹配，零成本 |
 | **Eagle** | `EagleProposer` | ✅ 需要模型 | Hidden States | 通用加速 | 使用目标模型的隐藏状态 |
-| **Eagle3** | `Eagle3Proposer` | ✅ 需要模型 | Hidden States | Llama/DeepSeek | Eagle 的增强版本 |
+| **Eagle3** | `EagleProposer`（同 Eagle 基类） | ✅ 需要模型 | Hidden States | Llama/DeepSeek | 专用 Eagle3 模型头 |
 | **Medusa** | `MedusaProposer` | ✅ 需要模型 | Hidden States | 通用加速 | 多头并行预测 |
-| **DFlash** | `DFlashProposer` | ✅ 需要模型 | Hidden States | Qwen3 系列 | 并行解码，支持多模态 |
-| **MTP** | `MTPProposer` | ✅ 需要模型 | Hidden States | DeepSeek V4 | Multi-Token Prediction |
+| **DFlash** | `DFlashProposer` | ✅ 需要模型 | Hidden States | Qwen3 系列 | 并行解码，Mask Token |
+| **MTP** | `Step3p5MTPProposer` / `Gemma4Proposer` | ✅ 需要模型 | Hidden States | DS / Gemma / Qwen | Multi-Token Prediction |
 | **Draft Model** | `DraftModelProposer` | ✅ 需要模型 | Token IDs | 通用加速 | 使用小型 draft 模型 |
-| **Suffix Decoding** | `SuffixProposer` | ❌ 无需模型 | Token IDs | 特定后缀场景 | 基于后缀匹配 |
+| **Suffix Decoding** | `SuffixDecodingProposer` | ❌ 无需模型 | Token IDs | 后缀匹配场景 | 基于后缀树缓存 |
+| **Custom Proposer** | `create_custom_proposer()` | 自定义 | 自定义 | 用户自定义 | 动态加载任意 Proposer |
+| **Hidden States Extract** | `ExtractHiddenStatesProposer` | ✅ 需要模型 | Hidden States | KV 传输场景 | 提取隐藏状态到 KV Cache |
 
 ### 1.3 源码规模
 
 | 项目 | 文件数 | 总行数 | 主要文件 |
 |------|--------|--------|---------|
-| **vLLM** | 12 | 4599 | `llm_base_proposer.py` (1809), `ngram_proposer_gpu.py` (662), `utils.py` (602) |
-| **vLLM-Ascend** | 10 | 2671 | `llm_base_proposer.py` (1979), `dflash_proposer.py` (265) |
+| **vLLM** | 15（+1 子目录） | 5661 | `llm_base_proposer.py` (1730), `ngram_proposer_gpu.py` (666), `utils.py` (602) |
+| **vLLM-Ascend** | 12 | 2636 | `llm_base_proposer.py` (1978), `dflash_proposer.py` (265), `extract_hidden_states_proposer.py` (116) |
 
 ---
 
@@ -59,6 +62,14 @@ graph TB
         Medusa[MedusaProposer<br/>Medusa 提议器]
         DFlash[DFlashProposer<br/>DFlash 提议器]
         Draft[DraftModelProposer<br/>Draft Model 提议器]
+        Suffix[SuffixDecodingProposer<br/>Suffix 提议器]
+        Custom[Custom Proposer<br/>用户自定义提议器]
+        HiddenExtract[ExtractHiddenStatesProposer<br/>隐藏状态提取]
+    end
+    
+    subgraph MTP_Layer["MTP 提议器层"]
+        Step3p5[Step3p5MTPProposer<br/>DeepSeek MTP]
+        Gemma4[Gemma4Proposer<br/>Gemma4 MTP]
     end
     
     subgraph Metadata["元数据层"]
@@ -69,6 +80,7 @@ graph TB
     subgraph Utils["工具层"]
         UtilsModule[utils.py<br/>辅助函数]
         Metrics[metrics.py<br/>性能指标]
+        Dynamic[dynamic/utils.py<br/>动态推测调度]
     end
     
     SpecConfig --> Base
@@ -79,20 +91,31 @@ graph TB
     Base --> Medusa
     Base --> DFlash
     Base --> Draft
+    Base --> Gemma4
+    
+    Eagle --> Step3p5
+    
+    Custom -.->|动态加载| Base
+    Suffix -.->|独立初始化| Base
+    HiddenExtract -.->|独立初始化| Base
     
     Ngram --> SpecMeta
     Eagle --> SpecMeta
     Medusa --> SpecMeta
     DFlash --> SpecMeta
     Draft --> SpecMeta
+    Step3p5 --> SpecMeta
+    Gemma4 --> SpecMeta
     
     SpecMeta --> SampleMeta
     
     UtilsModule --> Proposer
     Metrics --> Proposer
+    Dynamic --> SpecConfig
     
     style Config fill:#e1f5ff
     style Proposer fill:#fff9c4
+    style MTP_Layer fill:#ffe0b2
     style Metadata fill:#c8e6c9
     style Utils fill:#ffccbc
 ```
@@ -101,7 +124,7 @@ graph TB
 
 #### **2.2.1 SpecDecodeBaseProposer（基础提议器）**
 
-**文件**: `vllm/vllm/v1/spec_decode/llm_base_proposer.py` (1809 行)
+**文件**: `vllm/vllm/v1/spec_decode/llm_base_proposer.py` (1730 行)
 
 **核心职责**：
 1. **配置管理**: 管理推测解码配置参数
@@ -137,7 +160,7 @@ class SpecDecodeBaseProposer:
 
 #### **2.2.2 NgramProposer（N-gram 提议器）**
 
-**文件**: `vllm/vllm/v1/spec_decode/ngram_proposer.py` (285 行) + `ngram_proposer_gpu.py` (662 行)
+**文件**: `vllm/vllm/v1/spec_decode/ngram_proposer.py` (293 行) + `ngram_proposer_gpu.py` (666 行)
 
 **核心职责**：
 1. **N-gram 匹配**: 在历史 token 中查找匹配的 N-gram
@@ -160,43 +183,31 @@ flowchart LR
     style C fill:#c8e6c9
     style D fill:#ffccbc
     style E fill:#d1c4e9
-    style F fill:#f8bbd0
+    style F fill:#c8e6c9
 ```
 
-**关键参数**：
-- `min_n`: 最小 N-gram 长度（`prompt_lookup_min`）
-- `max_n`: 最大 N-gram 镕度（`prompt_lookup_max`）
-- `k`: 候选 token 数量（`num_speculative_tokens`）
-
-**算法实现**：
+**核心实现**：
 ```python
-# LPS (Longest Prefix Suffix) 算法
-# 在翻转后的 token 序列中查找最长匹配 N-gram
-def _find_longest_matched_ngram_and_propose_tokens(
-    origin_tokens,  # 原始 token 序列
-    min_ngram,      # 最小 N-gram 长度
-    max_ngram,      # 最大 N-gram 长度
-    k,              # 候选 token 数
-):
-    # 1. 翻转 token 序列
-    tokens = origin_tokens[::-1]
+# numba 优化的 LPS 数组计算
+@njit(parallel=True)
+def compute_lps_array(pattern, lps_result):
+    """KMP 算法的 LPS (Longest Prefix Suffix) 数组计算"""
+    for i in prange(len(pattern)):
+        # 并行计算每个位置的 LPS 值
+        ...
     
-    # 2. 计算 LPS 数组
-    lps = np.zeros(max_ngram, dtype=np.int32)
-    
-    # 3. 查找最长匹配
-    # 在翻转序列的前缀中查找与当前位置匹配的最长前缀
-    
-    # 4. 提取候选 token
-    # 从匹配位置开始提取后续 k 个 token
-    
-    return origin_tokens[start_position : start_position + k]
+# numba 优化的 N-gram 匹配
+@njit
+def find_ngram_match(reversed_history, reversed_pattern):
+    """查找最长匹配的 N-gram"""
+    ...
 ```
 
-**性能优化**：
-- **Numba JIT 编译**: 使用 `@njit(parallel=True)` 加速批量处理
-- **多线程并行**: 批量请求并行处理 N-gram 查找
-- **阈值控制**: 超过 8192 token 才启用多线程
+**特点**：
+- **零成本**: 无需额外的模型推理
+- **LPS 算法**: 高效查找最长匹配 N-gram
+- **GPU 加速**: GPU 版本使用 unfold + argmax 矢量化操作
+- **阈值控制**: 仅在 token 数 > 8192 时启用多线程
 
 ---
 
@@ -208,11 +219,13 @@ def _find_longest_matched_ngram_and_propose_tokens(
 1. **隐藏状态传递**: 使用目标模型的隐藏状态作为输入
 2. **Draft 模型推理**: 使用 Eagle draft 模型生成候选
 3. **树形解码**: 支持树形解码结构
+4. **Eagle3 支持**: 兼容 LlamaEagle3 和 DSEagle3 模型头
 
 **特点**：
 - 继承自 `SpecDecodeBaseProposer`
 - `pass_hidden_states_to_model = True`
 - 使用目标模型的最后一层隐藏状态
+- Eagle3 通过 `_get_eagle3_use_aux_hidden_state_from_config()` 配置辅助隐藏状态模式
 
 **工作流程**：
 ```mermaid
@@ -233,7 +246,7 @@ sequenceDiagram
 
 #### **2.2.4 MedusaProposer（Medusa 提议器）**
 
-**文件**: `vllm/vllm/v1/spec_decode/medusa.py` (78 行)
+**文件**: `vllm/vllm/v1/spec_decode/medusa.py` (81 行)
 
 **核心职责**：
 1. **多头预测**: 使用多个 Medusa head 并行预测多个 token
@@ -251,12 +264,9 @@ class MedusaProposer:
         logits = self.model.compute_logits(blocks)
         
         # 3. 每个 head argmax 选择 token
-        # logits 是一个列表，每个元素对应一个 head 的 logits
-        # Shape: [batch_size, vocab_size] per head
         draft_tokens = torch.stack([logit.argmax(dim=-1) for logit in logits], dim=1)
         
-        # 4. 返回候选 token
-        # Shape: [batch_size, num_heads]
+        # 4. 返回候选 token，Shape: [batch_size, num_heads]
         return draft_tokens
 ```
 
@@ -269,7 +279,7 @@ class MedusaProposer:
 
 #### **2.2.5 DFlashProposer（DFlash 提议器）**
 
-**文件**: `vllm/vllm/v1/spec_decode/dflash.py` (289 行)
+**文件**: `vllm/vllm/v1/spec_decode/dflash.py` (307 行)
 
 **核心职责**：
 1. **并行解码**: 所有候选 token 在一次前向中生成
@@ -338,7 +348,58 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
 ---
 
-#### **2.2.6 SpecDecodeMetadata（推测解码元数据）**
+#### **2.2.6 DraftModelProposer（Draft 模型提议器）**
+
+**文件**: `vllm/vllm/v1/spec_decode/draft_model.py` (88 行)
+
+**核心职责**：
+1. **完整 draft 模型**: 使用完整的轻量级模型作为提议器
+2. **独立模型配置**: 使用独立的 `draft_model_config` 加载模型
+3. **自动检查**: 验证词汇表大小和 TP 配置兼容性
+
+**特点**：
+- 继承自 `SpecDecodeBaseProposer`
+- `pass_hidden_states_to_model = False`（基于 token IDs）
+- 独立的 `_create_draft_vllm_config()` 创建 draft 模型配置
+- 使用 `get_model()` 加载完整模型
+- 强制要求 draft TP size = target TP size
+
+---
+
+#### **2.2.7 SuffixDecodingProposer（Suffix Decoding 提议器）**
+
+**文件**: `vllm/vllm/v1/spec_decode/suffix_decoding.py` (103 行)
+
+**核心职责**：
+1. **后缀树缓存**: 基于后缀树缓存历史响应，使用缓存内容推测
+2. **动态推测长度**: 每个请求在每一步可生成可变长度的 draft tokens
+3. **外部集成**: 使用 Arctic Inference 的 `SuffixDecodingCache` 实现
+
+**特点**：
+- 无需模型，基于缓存历史匹配
+- 支持 `max_tree_depth` / `max_spec_factor` / `min_token_prob` 参数
+- 每个请求独立管理后缀树
+- 自动管理 active/cached 请求生命周期
+
+---
+
+#### **2.2.8 MTP Proposer 簇（Multi-Token Prediction）**
+
+**Step3p5MTPProposer**（`step3p5.py`, 461 行）：
+- 继承自 `EagleProposer`
+- 支持逐层 draft-step 选择
+- 每层 MTP 使用独立的 `shared_head` 权重
+- 支持跨多个 KV cache group 的 draft layer
+
+**Gemma4Proposer**（`gemma4.py`, 340 行）：
+- 继承自 `SpecDecodeBaseProposer`
+- Gemma4 的 assistant 模型运行所有 decoder 层
+- 支持跨模型 KV 共享（target 和 draft 共享 KV cache）
+- 适用于 Gemma4 系列的 MTP 架构
+
+---
+
+#### **2.2.9 SpecDecodeMetadata（推测解码元数据）**
 
 **文件**: `vllm/vllm/v1/spec_decode/metadata.py` (66 行)
 
@@ -427,11 +488,13 @@ flowchart TB
     DraftPhase --> Eagle[Eagle/Medusa 方法<br/>基于隐藏状态]
     DraftPhase --> DFlash[DFlash 方法<br/>并行解码]
     DraftPhase --> Draft[Draft Model 方法<br/>小型模型推理]
+    DraftPhase --> Suffix[Suffix Decoding<br/>后缀树匹配]
     
     Ngram --> GenDraft[生成候选 Token 序列]
     Eagle --> GenDraft
     DFlash --> GenDraft
     Draft --> GenDraft
+    Suffix --> GenDraft
     
     GenDraft --> SpecMeta[创建 SpecDecodeMetadata]
     
@@ -528,86 +591,95 @@ def propose(sampled_token_ids, num_tokens_no_spec, token_ids_cpu):
             draft_token_ids.append(self.valid_ngram_draft[i, :self.valid_ngram_num_drafts[i]].tolist())
         else:
             draft_token_ids.append([])
-    
-    return draft_token_ids
 ```
 
 **Eagle/Medusa 方法**：
 ```python
 def propose(target_hidden_states, sampling_metadata):
-    # 1. 使用目标模型的隐藏状态
-    # target_hidden_states: [num_tokens, hidden_size]
-    
-    # 2. Draft 模型前向传播
+    # 1. Draft 模型前向传播
     draft_logits = draft_model(target_hidden_states)
     
-    # 3. 采样生成候选 token
-    draft_tokens = sampler(draft_logits)
+    # 2. 采样生成候选 token
+    draft_tokens = sample(draft_logits)
     
-    # 4. 返回候选序列
-    # draft_tokens: [batch_size, num_speculative_tokens]
+    # 3. 返回候选 token 序列
     return draft_tokens
 ```
 
----
-
-#### **步骤 4: Verify Phase**
-
+**DFlash 方法**：
 ```python
-# 1. 创建 SpecDecodeMetadata
-spec_decode_metadata = SpecDecodeMetadata(
-    draft_token_ids=draft_token_ids,
-    num_draft_tokens=num_draft_tokens,
-    cu_num_draft_tokens=cu_num_draft_tokens,
-    cu_num_sampled_tokens=cu_num_sampled_tokens,
-    target_logits_indices=target_logits_indices,
-    bonus_logits_indices=bonus_logits_indices,
-    logits_indices=logits_indices
-)
+def propose(target_hidden_states, sampling_metadata, slot_mappings):
+    # 1. 构建 Query Tokens（Next Token + Mask Tokens）
+    query_tokens = prepare_query_tokens(sampling_metadata)
+    
+    # 2. 拼接 Context + Query 的 positions
+    positions = prepare_positions(slot_mappings)
+    
+    # 3. DFlash 模型前向传播（一次前向生成所有候选）
+    draft_logits = model(query_tokens, positions)
+    
+    # 4. 从 logits 中提取候选 token
+    draft_tokens = extract_draft_tokens(draft_logits)
+    
+    return draft_tokens
+```
 
-# 2. 目标模型并行验证
-# 输入包含所有 draft tokens + bonus token
-target_logits = target_model(draft_tokens + bonus_tokens)
-
-# 3. 提取对应位置的 logits
-# target_logits_indices: 指向每个 draft token 的 logits
-# bonus_logits_indices: 指向最后一个 token 的 logits
-draft_logits = target_logits[target_logits_indices]
-bonus_logits = target_logits[bonus_logits_indices]
-
-# 4. 采样验证
-accepted_tokens = sampling_verify(draft_logits, bonus_logits, draft_token_ids)
+**Suffix Decoding 方法**：
+```python
+def propose(num_speculative_tokens, input_batch, sampled_token_ids):
+    draft_token_ids = []
+    for i, sampled_ids in enumerate(sampled_token_ids):
+        req_id = input_batch.req_ids[i]
+        
+        # 1. 管理后缀缓存（启动/续约请求）
+        if req_id not in suffix_cache.active_requests:
+            suffix_cache.start_request(req_id, prompt_token_ids)
+        suffix_cache.add_active_response(req_id, sampled_ids)
+        
+        # 2. 从后缀树推测后续 token
+        pattern = input_batch.token_ids_cpu[i, start:num_tokens]
+        draft = suffix_cache.speculate(req_id, pattern, ...)
+        
+        draft_token_ids.append(draft.token_ids)
+    
+    return draft_token_ids
 ```
 
 ---
 
-#### **步骤 5: Accept/Reject**
+#### **步骤 4: 创建 SpecDecodeMetadata**
 
 ```python
-def sampling_verify(draft_logits, bonus_logits, draft_token_ids):
-    accepted_tokens = []
-    
-    for i in range(num_draft_tokens):
-        # 1. 计算目标模型和 draft 模型的概率
-        target_prob = softmax(draft_logits[i])
-        draft_prob = softmax(draft_model_logits[i])
-        
-        # 2. 接受条件
-        # 如果 draft token 的概率 >= 目标概率 * uniform(0, 1)
-        if draft_prob[draft_token_ids[i]] >= target_prob[draft_token_ids[i]] * random():
-            accepted_tokens.append(draft_token_ids[i])
-        else:
-            # 拒绝后从目标分布采样
-            accepted_tokens.append(sample(target_prob))
-            break  # 剩余 draft tokens 全部拒绝
-    
-    # 3. Bonus token
-    # 如果所有 draft tokens 都接受，添加 bonus token
-    if len(accepted_tokens) == num_draft_tokens:
-        bonus_token = sample(softmax(bonus_logits))
-        accepted_tokens.append(bonus_token)
-    
-    return accepted_tokens
+# 从 draft token IDs 创建元数据
+metadata = SpecDecodeMetadata.make_dummy(
+    draft_token_ids=draft_token_ids,
+    device=device
+)
+
+# metadata 包含:
+# - draft_token_ids: 展平的 draft token ID 张量
+# - num_draft_tokens: 每个请求的 draft 数量
+# - cu_num_draft_tokens: 用于索引的累积和
+# - target_logits_indices: 目标模型 logits 索引
+```
+
+---
+
+#### **步骤 5: 验证（Verify Phase）**
+
+```python
+# 目标模型并行验证所有候选 token
+# 1. 设置 draft token 作为输入
+model.set_inputs(metadata.draft_token_ids)
+
+# 2. 一次前向传播计算所有候选 logits
+all_logits = model.forward()
+
+# 3. 使用 metadata.logits_indices 提取需要验证的 logits
+target_logits = all_logits[metadata.logits_indices]
+
+# 4. 采样验证（接受/拒绝）
+valid_tokens = sample_and_verify(target_logits)
 ```
 
 ---
@@ -618,12 +690,14 @@ def sampling_verify(draft_logits, bonus_logits, draft_token_ids):
 
 | 维度 | vLLM (CUDA) | vLLM-Ascend (NPU) | 差异说明 |
 |------|-------------|------------------|---------|
-| **Ngram GPU 实现** | `ngram_proposer_gpu.py` (662 行) | `ngram_proposer_npu.py` (35 行) | Ascend 实现简化，继承 GPU 版本 |
-| **DFlash 实现** | `dflash.py` (289 行) | `dflash_proposer.py` (265 行) | 相似实现，适配 NPU |
+| **Ngram GPU 实现** | `ngram_proposer_gpu.py` (666 行) | `ngram_proposer_npu.py` (35 行) | Ascend 简化实现，继承 GPU 版本 |
+| **DFlash 实现** | `dflash.py` (307 行) | `dflash_proposer.py` (265 行) | 相似实现，适配 NPU |
 | **Eagle 实现** | `eagle.py` (22 行) | `eagle_proposer.py` (19 行) | 相似实现 |
-| **Medusa 实现** | `medusa.py` (78 行) | `medusa_proposer.py` (70 行) | 相似实现 |
-| **Base Proposer** | `llm_base_proposer.py` (1809 行) | `llm_base_proposer.py` (1979 行) | Ascend 扩展更多功能 |
-| **Hidden States 处理** | 标准 CUDA tensor | NPU tensor + SP 处理 | Ascend 支持 Sequence Parallel |
+| **Medusa 实现** | `medusa.py` (81 行) | `medusa_proposer.py` (70 行) | 相似实现 |
+| **Draft Model 实现** | `draft_model.py` (88 行) | `draft_proposer.py` (17 行) | Ascend 继承并适配 |
+| **Suffix Decoding** | `suffix_decoding.py` (103 行) | `suffix_proposer.py` (24 行) | Ascend 继承并适配 |
+| **Hidden States 提取** | `extract_hidden_states.py` (398 行) | `extract_hidden_states_proposer.py` (116 行) | Ascend 适配 NPU + SP |
+| **Base Proposer** | `llm_base_proposer.py` (1730 行) | `llm_base_proposer.py` (1978 行) | Ascend 扩展更多功能 |
 | **CUDA/ACL Graph** | CUDA Graph 支持 | ACL Graph 支持 | Graph 机制不同 |
 
 ### 4.2 Ascend 特有优化
@@ -672,7 +746,6 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 @torch.inference_mode()
 def dummy_run(self, num_tokens, ...):
     # 用于 ACL Graph 捕获
-    pass
 ```
 
 ---
@@ -717,6 +790,21 @@ def dummy_run(self, num_tokens, ...):
 - 推理轮次减少 30%+
 - 整体吞吐提升 20%+
 
+### 5.4 动态推测调度（Dynamic SD）
+
+**文件**: `vllm/vllm/v1/spec_decode/dynamic/utils.py` (148 行)
+
+**功能**：根据实时 batch size 动态调整推测 token 数量，在高负载时减少推测深度以保持系统稳定。
+
+```python
+# 配置示例：batch_size 1-16 时推测 5 个 token
+# batch_size 32-128 时推测 2 个 token
+num_speculative_tokens_per_batch_size = [
+    (1, 16, 5),
+    (32, 128, 2),
+]
+```
+
 ---
 
 ## 六、使用示例
@@ -757,9 +845,6 @@ llm = LLM(
         "draft_model": "meta-llama/Llama-2-7b-eagle"
     }
 )
-
-sampling_params = SamplingParams(max_tokens=100)
-outputs = llm.generate(["Hello, world!"], sampling_params)
 ```
 
 ---
@@ -769,18 +854,54 @@ outputs = llm.generate(["Hello, world!"], sampling_params)
 ```python
 from vllm import LLM, SamplingParams
 
-# 配置 DFlash 推测解码（Qwen3 系列）
+# 配置 DFlash 推测解码（适用于 Qwen3 系列）
 llm = LLM(
     model="Qwen/Qwen3-7B",
     speculative_config={
         "method": "dflash",
-        "num_speculative_tokens": 6,
-        "parallel_drafting": True
+        "num_speculative_tokens": 5
     }
 )
+```
 
-sampling_params = SamplingParams(max_tokens=100)
-outputs = llm.generate(["Hello, world!"], sampling_params)
+---
+
+### 6.4 Draft Model 方法
+
+```python
+from vllm import LLM, SamplingParams
+
+# 配置 Draft Model 推测解码
+llm = LLM(
+    model="meta-llama/Llama-2-7b-hf",
+    speculative_config={
+        "method": "draft_model",
+        "num_speculative_tokens": 5,
+        "draft_model": "meta-llama/Llama-2-1b-hf"
+    }
+)
+```
+
+---
+
+### 6.5 动态推测调度
+
+```python
+from vllm import LLM, SamplingParams
+
+# 根据 batch size 动态调整推测深度
+llm = LLM(
+    model="meta-llama/Llama-2-7b-hf",
+    speculative_config={
+        "method": "ngram",
+        "num_speculative_tokens": 5,
+        "num_speculative_tokens_per_batch_size": [
+            (1, 16, 5),
+            (17, 32, 3),
+            (33, 128, 2),
+        ]
+    }
+)
 ```
 
 ---
@@ -793,11 +914,11 @@ outputs = llm.generate(["Hello, world!"], sampling_params)
 |------|---------|------|
 | **重复文本场景** | Ngram | 基于 N-gram 匹配，零额外成本 |
 | **通用加速** | Eagle/Medusa | 使用目标模型隐藏状态，效果稳定 |
-| **Qwen3 系列** | DFlash | 并行解码，支持多模态 |
-| **DeepSeek V4** | MTP | Multi-Token Prediction，专用优化 |
+| **Qwen3 系列** | DFlash | 并行解码，Mask Token 优化 |
+| **DeepSeek / Gemma / Qwen** | MTP (Step3p5 / Gemma4) | Multi-Token Prediction，专用优化 |
 | **资源受限** | Draft Model | 使用小型模型，成本可控 |
-
----
+| **后缀重复场景** | Suffix Decoding | 基于后缀树缓存，无需模型 |
+| **KV 传输场景** | Extract Hidden States | 提取隐藏状态到 KV Cache |
 
 ### 7.2 参数调优建议
 
@@ -815,7 +936,9 @@ outputs = llm.generate(["Hello, world!"], sampling_params)
 - DFlash: True（必须）
 - 其他方法: 根据需求选择
 
----
+**num_speculative_tokens_per_batch_size**（Dynamic SD）：
+- 低负载时增加推测深度
+- 高负载时减少推测深度
 
 ### 7.3 性能监控
 
@@ -854,34 +977,46 @@ class SpecDecodeMetrics:
 | **延迟** | 减少 30-50% 推理轮次 |
 | **吞吐** | 提升 20-40% 整体吞吐 |
 | **成本** | 降低目标模型计算次数 |
-| **灵活性** | 支持多种推测方法 |
+| **灵活性** | 支持多种推测方法，可扩展 Custom Proposer |
 
 ### 8.3 源码结构
 
 ```
 vllm/vllm/v1/spec_decode/
-├── llm_base_proposer.py         # 基础提议器 (1809 行)
-├── ngram_proposer.py            # Ngram 提议器 (285 行)
-├── ngram_proposer_gpu.py        # Ngram GPU 实现 (662 行)
+├── llm_base_proposer.py         # 基础提议器 (1730 行)
+├── ngram_proposer.py            # Ngram 提议器 (293 行)
+├── ngram_proposer_gpu.py        # Ngram GPU 实现 (666 行)
 ├── eagle.py                     # Eagle 提议器 (22 行)
-├── medusa.py                    # Medusa 提议器 (78 行)
-├── dflash.py                    # DFlash 提议器 (289 行)
+├── medusa.py                    # Medusa 提议器 (81 行)
+├── dflash.py                    # DFlash 提议器 (307 行)
+├── draft_model.py               # Draft Model 提议器 (88 行)
+├── suffix_decoding.py           # Suffix Decoding 提议器 (103 行)
+├── step3p5.py                   # Step3.5 MTP Proposer (461 行)
+├── gemma4.py                    # Gemma4 MTP Proposer (340 行)
+├── custom_class_proposer.py     # 自定义 Proposer 工厂 (73 行)
+├── extract_hidden_states.py     # 隐藏状态提取 (398 行)
 ├── metadata.py                  # 推测解码元数据 (66 行)
 ├── utils.py                     # 辅助函数 (602 行)
-└── metrics.py                   # 性能指标 (215 行)
+├── metrics.py                   # 性能指标 (281 行)
+└── dynamic/
+    └── utils.py                 # 动态推测调度 (148 行)
 
 vllm-ascend/vllm_ascend/spec_decode/
-├── llm_base_proposer.py         # Ascend 基础提议器 (1979 行)
+├── llm_base_proposer.py         # Ascend 基础提议器 (1978 行)
+├── ngram_proposer.py            # Ngram 提议器 (64 行)
 ├── ngram_proposer_npu.py        # Ngram NPU 实现 (35 行)
 ├── eagle_proposer.py            # Eagle 提议器 (19 行)
 ├── medusa_proposer.py           # Medusa 提议器 (70 行)
 ├── dflash_proposer.py           # DFlash 提议器 (265 行)
+├── draft_proposer.py            # Draft Model 提议器 (17 行)
+├── suffix_proposer.py           # Suffix Decoding 提议器 (24 行)
+├── extract_hidden_states_proposer.py  # 隐藏状态提取 (116 行)
 └── utils.py                     # 辅助函数 (31 行)
 ```
 
 ---
 
-**文档版本**: v1.0  
-**创建时间**: 2026-06-20  
-**基于源码**: vllm/vllm/v1/spec_decode/ + vllm-ascend/vllm_ascend/spec_decode/  
-**维护者**: vLLM 项目分析团队
+**文档版本**: v2.0  
+**创建时间**: 2026-06-27  
+**基于源码**: `vllm/vllm/v1/spec_decode/` + `vllm-ascend/vllm_ascend/spec_decode/`  
+**校验源文件**: `llm_base_proposer.py`、`ngram_proposer.py`、`ngram_proposer_gpu.py`、`eagle.py`、`medusa.py`、`dflash.py`、`draft_model.py`、`suffix_decoding.py`、`step3p5.py`、`gemma4.py`、`custom_class_proposer.py`、`extract_hidden_states.py`、`metadata.py`、`utils.py`、`metrics.py`、`dynamic/utils.py`
