@@ -4,19 +4,35 @@
 
 ---
 
-## 一、Mooncake项目概述
+## 一、Mooncake 项目概述
 
 ### 1.1 项目定位
 
-Mooncake是一个**KVCache为中心的解耦架构**，专为LLM服务设计。其核心思想是：
-- 将Prefill和Decoding集群分离
-- 利用GPU集群中闲置的CPU、DRAM、SSD资源构建解耦的KVCache缓存池
+Mooncake 是一个 **KVCache 为中心的解耦架构**，专为 LLM 服务设计。其核心思想是：
+
+- 将 Prefill 和 Decoding 集群分离
+- 利用 GPU/昇腾 NPU 集群中闲置的 CPU、DRAM、SSD 资源构建解耦的 KVCache 缓存池
 - 通过智能调度器平衡吞吐量和延迟要求
 
 **核心价值**：
-- 在长上下文场景中实现高达**525%吞吐量提升**
-- 在真实负载下处理**75%更多请求**
-- 获得FAST 2025 **最佳论文奖**
+
+- 在长上下文场景中实现高达 **525% 吞吐量提升**
+- 在真实负载下处理 **75% 更多请求**
+- 获得 FAST 2025 **最佳论文奖**
+
+### 1.2 项目结构
+
+Mooncake 项目由以下主要子模块组成：
+
+| 模块 | 路径 | 说明 |
+|------|------|------|
+| **Transfer Engine** | `mooncake-transfer-engine/` | C++ 核心传输引擎，多协议支持 |
+| **Store** | `mooncake-store/` | C++ 分布式 KVCache 存储，Master + Client 架构 |
+| **Common** | `mooncake-common/` | 公共配置和工具 |
+| **Integration** | `mooncake-integration/` | Python 绑定（pybind11） |
+| **Python Wheel** | `mooncake-wheel/` | Python 包入口，含 MooncakeConnector、CLI、Proxy Server |
+| **EP (Elastic Parallel)** | `mooncake-ep/` | 弹性专家并行 |
+| **RL (Reinforcement Learning)** | `mooncake-rl/` | RL 训练支持 |
 
 ### 1.2 核心组件体系
 
@@ -31,50 +47,94 @@ graph TB
     end
     
     subgraph Integration["集成层"]
-        PD_Disaggregation[PD解耦集成]
+        PD_Disaggregation[PD解耦集成<br/>mooncake_connector_v1.py]
         HiCache[层级KVCache]
-        EP_Support[弹性专家并行]
+        EP_Support[弹性专家并行<br/>mooncake-ep/]
+        Proxy_Server[Proxy Server<br/>vllm_v1_proxy_server.py]
+    end
+    
+    subgraph Python_Wheel["Python 包"]
+        MooncakeConnector[MooncakeConnector<br/>KVConnectorBase_V1]
+        CLI[CLI 工具<br/>cli.py / cli_client.py]
+        HTTP_Meta[HTTP Metadata Server]
+        Store_Service[Store Service<br/>REST API]
+        MooncakeConfig[配置管理<br/>MooncakeConfig]
+    end
+    
+    subgraph Integration_Bridge["C++ Python 绑定"]
+        TransferEnginePy[TransferEngine Pybind]
+        StorePy[Store Pybind]
+        EPPy[EP Pybind]
     end
     
     subgraph Store["存储层"]
-        Mooncake_Store[Mooncake Store<br/>分布式KVCache]
-        P2P_Store[P2P Store<br/>节点间临时对象共享]
+        Master_Service[Master Service<br/>全局元数据管理<br/>Allocation / Eviction]
+        Client_Service[Client Service<br/>本地存储代理]
+        Metadata_Shard[Metadata Shard<br/>1024 分片]
+        Buffer_Pool[Buffer Pool<br/>DRAM / SSD / LocalDisk]
+        Task_Manager[Task Manager<br/>CopyTask / MoveTask]
     end
     
     subgraph Engine["传输引擎层"]
         Transfer_Engine[Transfer Engine<br/>核心传输引擎]
-        Multi_Protocol[多协议支持<br/>TCP/RDMA/NVMe-of/CXL]
+        Transfer_Metadata[Transfer Metadata<br/>段注册 / 路由]
+        Multi_Transport[Multi Transport<br/>多协议路由]
+        Topology[拓扑管理器<br/>硬件拓扑感知]
+    end
+    
+    subgraph Transport["传输协议实现"]
+        RDMA[RDMA Transport<br/>verbs / rkey]
+        TCP[TCP Transport<br/>asio socket]
+        Ascend_Direct[Ascend Direct<br/>ADXL Engine / HIXL]
+        HCCL[HCCL Transport<br/>Ascend HCCL]
+        NVMeoF[NVMeoF Transport<br/>cuFile / GPU Direct]
+        NVLink[NVLink Transport<br/>NVIDIA GPU]
+        CXL[CXL Transport]
+        BAREX[BAREX Transport]
     end
     
     subgraph HW["硬件层"]
-        DRAM[DRAM内存池]
-        VRAM[GPU显存]
+        DRAM[DRAM 内存池]
+        VRAM[NPU显存<br/>HBM]
         NVMe[NVMe SSD]
-        RDMA[RDMA网络]
+        RDMA_NET[RDMA 网络<br/>RoCEv2 / IB]
+        HCCS[HCCS 互联<br/>119 GB/s]
     end
     
-    vLLM --> Integration
-    SGLang --> Integration
-    LMCache --> Integration
-    xLLM --> Integration
-    LMDeploy --> Integration
+    vLLM --> MooncakeConnector
+    MooncakeConnector --> TransferEnginePy
+    Proxy_Server --> vLLM
     
-    Integration --> Store
+    TransferEnginePy --> Transfer_Engine
+    StorePy --> Store
+    EPPy --> EP_Support
     
-    Mooncake_Store --> Engine
-    P2P_Store --> Engine
+    Store --> Transfer_Engine
     
-    Transfer_Engine --> Multi_Protocol
+    Transfer_Engine --> Multi_Transport
+    Transfer_Engine --> Transfer_Metadata
+    Transfer_Engine --> Topology
     
-    Multi_Protocol --> DRAM
-    Multi_Protocol --> VRAM
-    Multi_Protocol --> NVMe
-    Multi_Protocol --> RDMA
+    Multi_Transport --> RDMA
+    Multi_Transport --> TCP
+    Multi_Transport --> Ascend_Direct
+    Multi_Transport --> HCCL
+    Multi_Transport --> NVMeoF
+    Multi_Transport --> NVLink
+    Multi_Transport --> CXL
+    Multi_Transport --> BAREX
+    
+    Ascend_Direct --> HCCS
+    RDMA --> RDMA_NET
+    NVMeoF --> NVMe
     
     style App fill:#e1f5ff
     style Integration fill:#fff9c4
+    style Python_Wheel fill:#ffe0b2
+    style Integration_Bridge fill:#d1c4e9
     style Store fill:#c8e6c9
     style Engine fill:#ffccbc
+    style Transport fill:#f8bbd0
     style HW fill:#d1c4e9
 ```
 
@@ -86,16 +146,149 @@ graph TB
 
 #### 2.1.1 组件定位与核心职责
 
-**定位**：Mooncake的核心传输引擎，提供统一的数据传输接口
+**定位**：Mooncake 的核心传输引擎，提供统一的数据传输接口
 
 **核心职责**：
-1. **多协议支持**：TCP、RDMA、NVMe-of、CXL、NVLink等
-2. **多存储介质支持**：DRAM、VRAM（GPU显存）、NVMe SSD
+
+1. **多协议支持**：RDMA、TCP、Ascend Direct（ADXL/HIXL）、HCCL、NVMe-oF、NVLink、CXL、BAREX
+2. **多存储介质支持**：DRAM、VRAM（NPU 显存）、NVMe SSD
 3. **拓扑感知**：自动检测硬件拓扑，选择最优传输路径
 4. **批量传输**：高效的批量数据传输和异步完成机制
 5. **容错重试**：多级重试、超时检测、故障转移
 
-#### 2.1.2 架构分层设计
+#### 2.1.2 传输引擎架构
+
+```mermaid
+classDiagram
+    class TransferEngine {
+        +init(metadata_conn_string, local_server_name, ip_or_host_name, rpc_port)
+        +installTransport(proto, args) Transport
+        +registerLocalMemory(addr, length, location, remote_accessible, update_metadata)
+        +unregisterLocalMemory(addr, update_metadata)
+        +openSegment(segment_name) SegmentHandle
+        +closeSegment(handle)
+        +allocateBatchID(batch_size) BatchID
+        +submitTransfer(batch_id, requests)
+        +submitTransferWithNotify(batch_id, requests, notify_msg)
+        +getTransferStatus(batch_id, task_id, status)
+        +getBatchTransferStatus(batch_id, status)
+        +getNotifies(notifies)
+        +sendNotifyByID(target_id, notify_msg)
+        +sendNotifyByName(remote_agent, notify_msg)
+        +syncSegmentCache(segment_name)
+        +getLocalTopology() Topology
+    }
+
+    class Transport {
+        <<abstract>>
+        +submitTransfer(batch_id, requests)
+        +submitTransferTask(task_list)
+        +getTransferStatus(batch_id, task_id, status)
+        +install(local_server_name, meta, topo)
+        +registerLocalMemory(addr, length, location, remote_accessible, update_metadata)
+        +unregisterLocalMemory(addr, update_metadata)
+        +getName() string
+    }
+
+    class MultiTransport {
+        -transports: map~string, Transport*~
+        +selectTransport(request) Transport
+        +submitTransfer(batch_id, requests)
+        +installTransport(proto, args) Transport
+    }
+
+    class TransferMetadata {
+        +registerSegment(name, desc)
+        +unregisterSegment(segment_id)
+        +getSegmentDesc(segment_id) SegmentDesc
+        +syncSegmentCache()
+        +getLocalServerName() string
+    }
+
+    class TransferRequest {
+        +OpCode opcode  (READ / WRITE)
+        +void* source
+        +SegmentID target_id
+        +uint64_t target_offset
+        +size_t length
+        +int advise_retry_cnt
+    }
+
+    class TransferStatus {
+        +TransferStatusEnum s  (WAITING / PENDING / INVALID / CANCELED / COMPLETED / TIMEOUT / FAILED)
+        +size_t transferred_bytes
+    }
+
+    Topology --> TransferMetadata : 提供拓扑信息
+    TransferEngine --> MultiTransport : 路由传输请求
+    TransferEngine --> TransferMetadata : 管理段注册
+    MultiTransport --> Transport : 调用特定协议
+    TransferEngine *-- TransferRequest : 提交任务
+    TransferEngine *-- TransferStatus : 查询状态
+```
+
+#### 2.1.3 传输引擎实现
+
+`TransferEngine` 是核心入口类，`TransferEngineImpl` 持有具体实现：
+
+```cpp
+// 文件: mooncake-transfer-engine/include/transfer_engine.h
+namespace mooncake {
+
+class TransferEngine {
+public:
+    // 构造函数（auto_discover: 是否自动发现拓扑）
+    TransferEngine(bool auto_discover = false);
+
+    // 初始化
+    int init(const std::string& metadata_conn_string,
+             const std::string& local_server_name,
+             const std::string& ip_or_host_name = "",
+             uint64_t rpc_port = 12345);
+
+    // 安装传输协议（返回传输实例）
+    Transport* installTransport(const std::string& proto, void** args);
+    int uninstallTransport(const std::string& proto);
+
+    // 内存注册
+    int registerLocalMemory(void* addr, size_t length,
+                            const std::string& location = kWildcardLocation,
+                            bool remote_accessible = true,
+                            bool update_metadata = true);
+    int unregisterLocalMemory(void* addr, bool update_metadata = true);
+
+    // 段管理（Segment = 远程节点的内存池抽象）
+    SegmentHandle openSegment(const std::string& segment_name);
+    int closeSegment(SegmentHandle handle);
+    int removeLocalSegment(const std::string& segment_name);
+
+    // 批量传输
+    BatchID allocateBatchID(size_t batch_size);
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest>& entries);
+    Status submitTransferWithNotify(
+        BatchID batch_id, const std::vector<TransferRequest>& entries,
+        TransferMetadata::NotifyDesc notify_msg);
+
+    // 状态查询
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
+                             TransferStatus& status);
+    Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
+
+    // 通知机制
+    int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
+    int sendNotifyByID(SegmentID target_id,
+                       TransferMetadata::NotifyDesc notify_msg);
+
+    // 元数据同步
+    int syncSegmentCache(const std::string& segment_name = "");
+
+    // 拓扑信息
+    std::shared_ptr<Topology> getLocalTopology();
+};
+
+}  // namespace mooncake
+```
 
 ```mermaid
 sequenceDiagram
@@ -153,7 +346,7 @@ sequenceDiagram
     TE-->>User: 返回状态<br/>SUCCESS/FAILED/TIMEOUT
 ```
 
-#### 2.1.3 核心数据结构
+#### 2.1.4 核心数据结构
 
 **TransferRequest（传输请求）**：
 
@@ -200,7 +393,7 @@ struct Slice {
 };
 ```
 
-#### 2.1.4 关键特性实现机制
+#### 2.1.5 关键特性实现机制
 
 ##### 1. 多协议支持机制
 
@@ -582,7 +775,106 @@ sequenceDiagram
     Note over User: Get操作完成<br/>数据一致性保证
 ```
 
-#### 2.2.3 核心数据结构
+#### 2.2.3 核心 API（RPC 接口）
+
+Mooncake Store 通过 `MasterService` 暴露以下核心 RPC 接口（基于 coro_rpc）：
+
+```cpp
+// 文件: mooncake-store/include/rpc_service.h
+namespace mooncake {
+
+class WrappedMasterService {
+public:
+    // Put 操作（三阶段：Start → 传输数据 → End）
+    PutStart(client_id, key, slice_length, ReplicateConfig)
+        → vector<Replica::Descriptor>     // 分配副本
+    PutEnd(client_id, key, replica_type)  // 完成写入，标记 COMPLETE
+    PutRevoke(client_id, key, replica_type)  // 撤销写入
+
+    BatchPutStart(client_id, keys, slice_lengths, config)
+        → vector<vector<Replica::Descriptor>>
+    BatchPutEnd(client_id, keys)
+    BatchPutRevoke(client_id, keys)
+
+    // Get 操作（获取副本列表供直接读取）
+    GetReplicaList(key) → GetReplicaListResponse  // 含 replicas + lease_ttl_ms
+    BatchGetReplicaList(keys) → vector<GetReplicaListResponse>
+
+    // 删除操作
+    Remove(key)
+    RemoveByRegex(regex) → long       // 正则匹配删除
+    RemoveAll() → long                 // 清空所有
+
+    // 段管理
+    MountSegment(segment, client_id)  // 挂载内存段
+    ReMountSegment(segments, client_id)
+    UnmountSegment(segment_id, client_id)
+
+    // 心跳与健康
+    Ping(client_id) → PingResponse    // 含 view_version_id + client_status
+    ServiceReady() → string
+
+    // 本地磁盘卸载（SSD offloading）
+    MountLocalDiskSegment(client_id, enable_offloading)
+    OffloadObjectHeartbeat(client_id, enable_offloading)
+
+    // 后台任务
+    CreateCopyTask(key, targets) → UUID    // 复制对象
+    CreateMoveTask(key, source, target) → UUID  // 移动对象
+    QueryTask(task_id) → QueryTaskResponse
+};
+```
+
+**Put 操作三阶段协议**：
+
+```
+1. PutStart:  Master 分配副本 Buffer，状态 INITIALIZED
+2. 数据传输: Client 通过 Transfer Engine 写入远程 Buffer
+3. PutEnd:    Master 标记副本 COMPLETE，对象可被读取
+```
+
+#### 2.2.4 核心数据结构
+
+**Segment（存储段）**：最小可挂载的内存单元
+
+```cpp
+// 文件: mooncake-store/include/types.h
+struct Segment {
+    UUID id{0, 0};               // 全局唯一 ID
+    std::string name{};          // 逻辑名称（用于偏好分配）
+    uintptr_t base{0};           // 基地址
+    size_t size{0};              // 大小（字节）
+    std::string te_endpoint{};   // Transfer Engine p2p 端点（ip:port）
+};
+```
+
+**Replica（副本）**：数据副本的组织方式
+
+```cpp
+// 文件: mooncake-store/include/replica.h
+
+enum class ReplicaType { MEMORY, DISK, LOCAL_DISK };
+
+enum class ReplicaStatus {
+    UNDEFINED = 0,   // 未初始化
+    INITIALIZED,     // 空间已分配，等待写入
+    PROCESSING,      // 写入中
+    COMPLETE,        // 写入完成，可用
+    REMOVED,         // 已删除
+    FAILED           // 故障标记
+};
+
+struct ReplicateConfig {
+    size_t replica_num{1};                      // 副本数
+    bool with_soft_pin{false};                  // 是否软钉（防淘汰）
+    std::vector<std::string> preferred_segments{};  // 偏好段
+    bool prefer_alloc_in_same_node{false};      // 优先同节点
+};
+
+struct MemoryReplicaData {
+    std::unique_ptr<AllocatedBuffer> buffer;   // 分配的内存 Buffer
+};
+```
 
 **ObjectMetadata（对象元数据）**：
 
@@ -650,19 +942,19 @@ struct SegmentDesc {
 };
 ```
 
-#### 2.2.4 内存分配策略
+#### 2.2.6 内存分配策略
 
-**两种Allocator实现**：
+**两种 Allocator 实现**：
 
 ```mermaid
 flowchart TB
     subgraph Allocators["内存分配器"]
-        CachelibAllocator[CachelibBufferAllocator<br/>Facebook CacheLib]
+        CachelibAllocator[CachelibBufferAllocator<br/>Facebook CacheLib / Slab]
         OffsetAllocator[OffsetBufferAllocator<br/>偏移分配器]
     end
     
-    subgraph Cachelib["CacheLib实现"]
-        SlabAlloc[Slab分配策略<br/>适合小块内存]
+    subgraph Cachelib["CacheLib 实现"]
+        SlabAlloc[Slab 分配策略<br/>适合小块内存]
         HighUtilization[内存利用率高]
         Fragmentation[有碎片问题]
     end
@@ -682,6 +974,23 @@ flowchart TB
 ```
 
 **AllocationStrategy（副本分配策略）**：
+
+`RandomAllocationStrategy` 是默认实现，其核心逻辑在 `master_service.h` 中：
+
+```cpp
+// 文件: mooncake-store/include/allocation_strategy.h
+class AllocationStrategy {
+public:
+    // 尽力而为分配：尽量满足 replica_num，但 Segment 不足时减少
+    // 保证同一对象的副本在不同 Segment 上
+    virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager,
+        const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments = {},
+        const std::set<std::string>& excluded_segments = {}) = 0;
+};
+```
 
 ```mermaid
 sequenceDiagram
@@ -742,7 +1051,7 @@ sequenceDiagram
 - 尽可能分配请求的副本数，资源不足时降级分配
 - 同一对象的副本必须在不同Segment（副本隔离）
 
-#### 2.2.5 淘汰策略
+#### 2.2.7 淘汰策略
 
 **两阶段淘汰算法**：
 
@@ -796,7 +1105,7 @@ flowchart TD
 - **软租约（soft_pin_timeout）**：VIP对象额外保护，延长租约时间
 - **租约更新**：每次Get操作会续租
 
-#### 2.2.6 副本一致性机制
+#### 2.2.8 副本一致性机制
 
 **副本生命周期管理**：
 
@@ -837,14 +1146,24 @@ stateDiagram-v2
     end note
 ```
 
-**写入一致性保障**：
-- PutStart分配所有副本后才开始写入
-- PutEnd必须所有副本都写入成功
-- PutRevoke处理写入失败情况
+**写入一致性保障（三阶段协议）**：
+
+```
+1. PutStart:  Master 分配副本 Buffer，状态 INITIALIZED
+2. 数据传输: Client 通过 Transfer Engine 写入远程 Buffer
+3. PutEnd:    Master 标记副本 COMPLETE，对象可被读取
+```
+
+- PutStart 分配所有副本后才开始写入
+- PutEnd 必须所有副本都写入成功
+- PutRevoke 处理写入失败情况（回滚到 INITIALIZED）
 
 **读取一致性保障**：
-- 只读取COMPLETE状态的副本
+
+- 只读取 COMPLETE 状态的副本
+- `GetReplicaList` 返回的副本带 `lease_ttl_ms`（租约时间）
 - 支持副本降级：如果某个副本失败，尝试其他副本
+- `Remove` / `RemoveByRegex` / `RemoveAll` 用于清理
 
 ---
 
@@ -1594,6 +1913,31 @@ class MasterService {
 
 ### 5.2 租约与软钉机制
 
+**租约（Lease）机制**用于管理对象读取的临时锁定：
+
+**硬租约（Lease Timeout）**：
+
+- `GetReplicaList` 返回的副本附带 `lease_ttl_ms`
+- 客户端在租约有效期内可直接读取副本
+- 租约到期后，Master 可淘汰该对象而无需通知客户端
+
+**软钉（Soft Pin）机制**：
+
+- `ReplicateConfig.with_soft_pin` 控制是否软钉
+- 软钉对象在一段时间内免于淘汰（`default_kv_soft_pin_ttl` = 30 分钟）
+- `allow_evict_soft_pinned_objects` 配置是否允许在压力下淘汰软钉对象
+
+**淘汰算法配置参数**：
+
+```cpp
+// 文件: mooncake-store/include/types.h
+static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL = 5000;        // 5s
+static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS = 30 * 60 * 1000;  // 30 min
+static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
+static constexpr double DEFAULT_EVICTION_RATIO = 0.05;               // 5%
+static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95; // 95%
+```
+
 ```mermaid
 sequenceDiagram
     participant Object as ObjectMetadata
@@ -1877,6 +2221,6 @@ preferred_segments: ["local_segment"] # 优先本地Segment
 
 ---
 
-**文档版本**：v1.0
-**生成时间**：2026-06-20
-**基于源码版本**：Mooncake开源版本（GitHub）
+**生成时间**：2026-06-27
+**基于源码版本**：Mooncake 本地工作目录（June 2026）
+**校验源文件**：`mooncake-transfer-engine/include/transfer_engine.h`、`mooncake-transfer-engine/src/transfer_engine.cpp`、`mooncake-transfer-engine/src/multi_transport.cpp`、`mooncake-transfer-engine/include/transport/transport.h`、`mooncake-transfer-engine/include/transfer_metadata.h`、`mooncake-store/include/master_service.h`、`mooncake-store/include/rpc_service.h`、`mooncake-store/include/replica.h`、`mooncake-store/include/segment.h`、`mooncake-store/include/types.h`、`mooncake-store/include/allocation_strategy.h`、`mooncake-wheel/mooncake/mooncake_connector_v1.py`、`mooncake-wheel/mooncake/mooncake_config.py`

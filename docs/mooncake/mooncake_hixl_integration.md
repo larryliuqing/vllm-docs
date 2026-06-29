@@ -44,51 +44,70 @@
 ```mermaid
 graph TB
     subgraph Mooncake["Mooncake 层"]
+        TE[Transfer Engine<br/>传输引擎]
         MS[Mooncake Store<br/>分布式 KVCache]
         P2P[P2P Store<br/>节点间对象共享]
     end
     
-    subgraph HIXL["HIXL 层"]
-        LLM_DataDist[LLM-DataDist<br/>KV Cache 语义接口]
-        HIXL_Engine[HIXL Engine<br/>核心传输引擎]
+    subgraph Transport_Layer["传输协议层<br/>Mooncake Transport 实现"]
+        ADT[AscendDirectTransport<br/>ADXL Engine 封装]
+        HCCL[HCCL Transport<br/>基于 HCCL 集合通信]
+        HRT[HeterogeneousRdmaTransport<br/>异构 RDMA 互联]
+        RDMA[RDMA Transport<br/>ibverbs]
+        TCP[TCP Transport<br/>asio socket]
     end
     
-    subgraph Transport["传输层"]
+    subgraph HIXL["HIXL / 硬件层"]
+        ADXL[ADXL Engine<br/>Ascend Data Xfer Library]
         HCCS[HCCS<br/>芯片内互联<br/>119 GB/s]
-        RDMA[RDMA<br/>跨节点传输<br/>22 GB/s]
+        RDMA_HW[RDMA<br/>跨节点传输<br/>22 GB/s]
         PCIe[PCIe<br/>芯片间互联]
     end
     
-    subgraph Hardware["硬件层"]
-        A2[Atlas A2 系列]
-        A3[Atlas A3 系列]
+    subgraph Hardware["硬件设备"]
+        A2[Atlas A2 系列<br/>910B / 910-93]
+        A3[Atlas A3 系列<br/>950 (A3)]
     end
     
-    MS --> LLM_DataDist
-    P2P --> LLM_DataDist
+    MS --> TE
+    P2P --> TE
     
-    LLM_DataDist --> HIXL_Engine
+    TE --> ADT
+    TE --> HCCL
+    TE --> HRT
+    TE --> RDMA
+    TE --> TCP
     
-    HIXL_Engine --> HCCS
-    HIXL_Engine --> RDMA
-    HIXL_Engine --> PCIe
+    ADT --> ADXL
+    HCCL --> HCCS
+    HRT --> RDMA_HW
+    RDMA --> RDMA_HW
+    TCP --> PCIe
+    
+    ADXL --> HCCS
+    ADXL --> RDMA_HW
+    ADXL --> PCIe
     
     HCCS --> A2
     HCCS --> A3
-    RDMA --> A2
-    RDMA --> A3
+    RDMA_HW --> A2
+    RDMA_HW --> A3
     PCIe --> A2
     PCIe --> A3
     
     style Mooncake fill:#e1f5ff
+    style Transport_Layer fill:#f8bbd0
     style HIXL fill:#fff9c4
-    style Transport fill:#c8e6c9
     style Hardware fill:#ffccbc
 ```
 
 ### 2.2 集成方式
 
-Mooncake 通过 **Ascend Direct Transport** 与 HIXL 集成：
+Mooncake 通过 Mooncake 集成层与 HIXL 集成：
+
+- **C++ 层面**：`AscendDirectTransport` 直接封装 ADXL Engine（`adxl/adxl_engine.h`），编译时通过 `-DUSE_ASCEND_DIRECT=ON` 启用
+- **Python 层面**：`mooncake-integration/transfer_engine/transfer_engine_py.cpp` 通过 pybind11 暴露给 Python
+- **运行时传输**：ADXL Engine 负责自动选择 HCCS/RDMA/PCIe 链路
 
 **编译时启用**：
 ```bash
@@ -117,11 +136,47 @@ store.setup(
 
 ## 三、HIXL 为 Mooncake 提供的能力
 
-### 3.1 零拷贝传输接口
+### 3.1 传输类型
 
-HIXL 为 Mooncake Store 提供了 4 个零拷贝传输接口：
+HIXL 支持 4 种传输类型，在 Ascend Direct Transport 中通过 ADXL Engine 实现：
 
-#### **1. batch_put_from**
+| 传输类型 | 方向 | 场景 |
+|---------|------|------|
+| **D2D (Device-to-Device)** | NPU → NPU | 同/跨节点 NPU 间 KVCache 传输 |
+| **D2H (Device-to-Host)** | NPU → CPU | KVCache 卸载到 Host |
+| **H2D (Host-to-Device)** | CPU → NPU | 从 Host 加载回 NPU |
+| **H2H (Host-to-Host)** | CPU → CPU | Host 内存传输 |
+
+传输通过 `AscendDirectTransport` 实现，内部使用 `adxl::Engine`（ADXL）的 `Transfer` / `TransferAsync` 接口：
+
+```cpp
+// 文件: mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h
+
+class AscendDirectTransport : public Transport {
+public:
+    // 通过 ADXL Engine 执行传输
+    // adxl_->Transfer(src_desc, dest_desc, stream, timeout_ms)
+    // adxl_->TransferAsync(src_desc, dest_desc, callback)
+    
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest>& entries) override;
+    
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& task_list) override;
+    
+    int install(std::string& local_server_name,
+                std::shared_ptr<TransferMetadata> meta,
+                std::shared_ptr<Topology> topo) override;
+    
+    const char* getName() const override { return "ascend_direct"; }
+    
+    int registerLocalMemory(void* addr, size_t length,
+                            const std::string& location, bool remote_accessible,
+                            bool update_metadata) override;
+};
+```
+
+#### **1. batch_put_from**（Python 绑定调用 Transfer Engine 写入）
 
 **功能**: 批量上传数据到 Mooncake Store（零拷贝）
 
@@ -153,7 +208,7 @@ results = store.batch_put_from(keys, addrs, sizes)
 
 ---
 
-#### **2. batch_get_into**
+#### **2. batch_get_into**（Python 绑定调用 Transfer Engine 读取）
 
 **功能**: 批量从 Mooncake Store 下载数据（零拷贝）
 
@@ -567,7 +622,7 @@ aligned_addr = (addr + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
 
 ---
 
-**文档版本**: v1.0  
-**创建时间**: 2026-06-20  
-**基于源码**: hixl/ + Mooncake 集成示例  
+**文档版本**: v2.0  
+**创建时间**: 2026-06-27  
+**基于源码**: `mooncake-transfer-engine/include/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h`、`mooncake-transfer-engine/src/transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.cpp`、`Mooncake 集成示例代码`
 **维护者**: vLLM-Ascend 项目团队

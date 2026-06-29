@@ -1,7 +1,7 @@
 # Mooncake 文档审查报告
 
-> 审查日期：2026-06-20
-> 审查范围：docs/mooncake_architecture_and_workflow.md vs Mooncake 源码和设计文档
+> 审查日期：2026-06-27
+> 审查范围：docs/mooncake/ 目录下全部文档 vs Mooncake 源码和设计文档
 
 ---
 
@@ -11,9 +11,9 @@
 
 | 项目 | 数量/大小 |
 |------|---------|
-| **现有文档** | 1 个 (mooncake_architecture_and_workflow.md) |
-| **文档行数** | 1881 行 (~180KB) |
-| **源码文件** | 58 个 Python 文件 |
+| **现有文档** | 4 个 (mooncake 目录下) |
+| **文档行数** | 1881+ 行 (~180KB+) |
+| **源码文件** | 58 个 Python 文件 + 30+ C++ 源文件 |
 | **设计文档** | 70+ Markdown 文件 |
 | **覆盖度** | 核心功能 85%，集成场景 90% |
 
