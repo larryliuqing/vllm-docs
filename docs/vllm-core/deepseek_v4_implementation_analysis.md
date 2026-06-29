@@ -747,9 +747,675 @@ class DeepseekV4FP8Config(Fp8Config):
 
 ---
 
-## 四、核心实现对比（vLLM vs vLLM-Ascend）
+## 四、vLLM-Ascend 源码详解
 
-### 4.1 注意力机制（MLA）
+> vLLM-Ascend 的 DS V4 模型全部实现在 `vllm_ascend/models/deepseek_v4.py`（1,355 行）这一个文件中，外加两个自定义算子文件（`ops/dsa.py` 272 行 + `ops/rope_dsv4.py` 238 行），结构远比 vLLM 的 36 个文件精简。
+
+### 4.1 文件结构与层次
+
+```
+AscendDeepseekV4ForCausalLM               # 顶层，多继承 SupportsPP + SupportsLoRA + SupportsEagle
+  └─ DeepseekV4Model                      # 主干网络（@support_torch_compile）
+       ├─ embed_tokens (VocabParallelEmbedding)
+       ├─ DeepseekV2DecoderLayer × N      # 注意：命名是 V2，实际是 V4 DecoderLayer
+       │    ├─ self_attn: DeepseekV4Attention  # 封装了 AscendDeepseekSparseAttention
+       │    └─ mlp: DeepseekV4MoE
+       └─ norm (RMSNorm)
+```
+
+**类命名差异**：vLLM-Ascend 大量使用 `DeepseekV2*` 前缀（如 `DeepseekV2DecoderLayer`、`DeepseekV2MLP`、`DeepseekV2MixtureOfExperts`），这是因为 Ascend 代码从 V2 版本演进而来，但实际上是 V4 架构。
+
+### 4.2 详解：辅助函数
+
+```
+deepseek_v4.py`, lines 94-183
+```
+
+**`hadamard_transform_ref`**（lines 94-108）：Hadamard 变换，用于激活值旋转
+```python
+def hadamard_transform_ref(x, scale=1.0):
+    from scipy.linalg import hadamard
+    # 将输入 x 通过 Hadamard 矩阵变换
+    # SC20 论文：用 Hadamard 变换替代 LayerNorm 的部分功能
+```
+
+**`precompute_freqs_cis_cpu`**（lines 116-151）：YLRC（YaRN Linear Ramp Correction）RoPE 频率预计算
+```python
+def precompute_freqs_cis_cpu(dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow):
+    # 1. 计算 base → freqs (θ_i = 1/(base^(2i/d)))
+    # 2. Yarn: 对超出 original_seq_len 的维度做 NTK-aware scaling
+    # 3. 用 torch.polar 生成复数 cis 值
+```
+
+**`apply_rotary_emb`**（lines 154-175）：通过复数乘法应用 RoPE
+```python
+def apply_rotary_emb(x, freqs_cis, inverse=False):
+    x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    if inverse:
+        freqs_cis = freqs_cis.conj()  # 逆 RoPE（用于输出投影）
+    x = torch.view_as_real(x * freqs_cis.to(x.device)).flatten(-2)
+```
+
+**`get_spec_layer_idx_from_weight_name`**（lines 178-183）：从权重名解析 MTP 层索引，用于权重加载时跳过 MTP 层。
+
+---
+
+### 4.3 详解：`DeepseekV2MLP`（前馈网络）
+
+```
+deepseek_v4.py`, lines 184-226
+```
+
+与 vLLM NVIDIA 的 `DeepseekV4MLP` 几乎相同——SwiGLU 结构，`MergedColumnParallelLinear` + `RowParallelLinear`。
+
+```python
+class DeepseekV2MLP(nn.Module):
+    def __init__(self, ..., is_sequence_parallel=False, ...):
+        self.gate_up_proj = MergedColumnParallelLinear(hidden_size, [intermediate_size] * 2, ...)
+        self.down_proj = RowParallelLinear(intermediate_size, hidden_size, ...)
+        self.act_fn = SiluAndMul()
+    
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+```
+
+---
+
+### 4.4 详解：`DeepseekV4MoE`（混合专家层）
+
+```
+deepseek_v4.py`, lines 229-385
+```
+
+**初始化**（lines 230-333）：
+
+```python
+class DeepseekV4MoE(nn.Module):
+    def __init__(self, config, parallel_config, quant_config, prefix, is_draft_layer=False):
+        # EP 设置（Ascend 默认开启 Expert Parallel）
+        self.ep_group = get_ep_group().device_group
+        self.ep_rank = get_ep_group().rank_in_group
+        self.ep_size = self.ep_group.size()
+        
+        # mix_placement: Ascend 独有功能——shared experts 与 routed experts 混合放置
+        self.is_fusion_moe_shared_experts_enabled = getattr(get_ascend_config(), "mix_placement", False)
+        if config.n_shared_experts is None or self.is_fusion_moe_shared_experts_enabled:
+            self.shared_experts = None  # 由 FusedMoE 内部管理
+        else:
+            self.shared_experts = DeepseekV2MLP(...)
+        
+        # Gate（路由层）
+        self.gate = ReplicatedLinear(hidden_size, n_routed_experts, ...)
+        self.gate.precast_fp32_weight = True  # Ascend 特有: gate 权重强制 fp32
+        
+        # FusedMoE（统一管理 routed + shared experts）
+        self.experts = FusedMoE(
+            shared_experts=self.shared_experts,
+            gate=self.gate,
+            use_grouped_topk=True,               # 分组 topk（V4 特性）
+            num_expert_group=config.n_group,
+            topk_group=config.topk_group,
+            scoring_func="softmax",
+            enable_eplb=self.enable_eplb,
+            is_sequence_parallel=self.is_sequence_parallel,
+            n_shared_experts=config.n_shared_experts if mix_placement else 0,
+            ...
+        )
+```
+
+**Ascend vs NVIDIA 的 MoE 关键区别**：
+| 维度 | NVIDIA | Ascend |
+|------|--------|--------|
+| 专家并行 | `get_ep_group()`（MegaMoE 必需） | `get_ep_group()`（默认开启） |
+| Gate 精度 | `GateLinear` + `out_dtype=torch.float32` | `ReplicatedLinear` + `precast_fp32_weight=True` |
+| Router | `fused_topk_bias` + `sqrtsoftplus` | `F.linear` + `softmax`（FusedMoE 内部） |
+| Shared experts | `DeepseekV4MLP` 独立模块 | 支持 `mix_placement` 集成到 FusedMoE |
+| 专家量化 | 支持 FP4（`DeepseekV4MegaMoEExperts`） | 仅 FP8（FusedMoE 泛化支持） |
+| Grouped topk | 非显式 | `use_grouped_topk=True` |
+| Sequence parallel | 条件生效 | 支持 `is_sequence_parallel` + chunk/all_gather |
+
+**forward**（lines 335-385）：
+
+```python
+def forward(self, hidden_states, input_ids=None):
+    # 1. Sequence parallel chunk（若开启）
+    if self.is_sequence_parallel:
+        hidden_states = sequence_parallel_chunk(hidden_states)
+    
+    # 2. Router（gate 或 FusedMoE 内部）
+    if self.experts.is_internal_router:
+        fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
+    else:
+        router_logits = F.linear(hidden_states.float(), self.gate.weight)
+        fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+    
+    # 3. Shared experts 融合（FusedMoE 包返回 tuple 时）
+    if fused_moe_out_is_tuple:
+        shared_output, final_hidden_states = fused_moe_out
+        if self.shared_experts is not None:
+            final_hidden_states = muls_add_triton(final_hidden_states, shared_output, ...)
+        else:
+            final_hidden_states *= self.routed_scaling_factor
+    
+    # 4. All gather（sequence parallel 后）
+    if self.is_sequence_parallel:
+        final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
+    
+    return final_hidden_states
+```
+
+使用 `muls_add_triton`（Ascend 自定义 Triton 算子）替代 NVIDIA 的简单加法，支持乘以 scale factor。
+
+---
+
+### 4.5 详解：`Indexer` 和 `Compressor`
+
+#### 4.5.1 Indexer（索引器）
+
+```
+deepseek_v4.py`, lines 404-468
+```
+
+```python
+class Indexer(nn.Module):
+    def __init__(self, vllm_config, config, compress_ratio, quant_config, cache_config, prefix):
+        self.wq_b = ReplicatedLinear(q_lora_rank, n_heads * head_dim, ...)
+        self.weights_proj = ReplicatedLinear(hidden_size, n_heads, ...)
+        
+        # KV cache 类型（按设备区分）
+        k_dtype = torch.float8_e4m3fn if A5 else torch.int8
+        self.k_cache = DeepseekV4IndexerCache(head_dim, dtype=k_dtype, ...)
+        
+        # Compressor（压缩比 >1 时启用）
+        if compress_ratio > 1:
+            self.compressor = Compressor(vllm_config, config, compress_ratio, ...)
+    
+    def forward(self, hidden_states, qr, positions, rotary_emb):
+        return  # 空 forward，实际逻辑集成在 DSA 内部
+```
+
+**与 NVIDIA 的关键差异**：NVIDIA 使用 `DeepseekV4Indexer`（`attention.py:662`），有完整的 `forward` 实现；Ascend 的 `Indexer` 仅负责参数管理和缓存，实际计算在 DSA 内部完成。
+
+#### 4.5.2 Compressor（压缩器）
+
+```
+deepseek_v4.py`, lines 471-578
+```
+
+```python
+class Compressor(nn.Module):
+    def __init__(self, ..., compress_ratio=4, head_dim=512, rotate=False, ...):
+        # Absolute Position Embedding
+        self.ape = nn.Parameter(torch.empty(compress_ratio, coff * head_dim, ...))
+        
+        # WKV + Wgate（V4 将 wkv 和 wgate 分开）
+        self.wkv = ReplicatedLinear(dim, coff * head_dim, ...)
+        self.wgate = ReplicatedLinear(dim, coff * head_dim, ...)
+        
+        # State cache（按压缩比区分）
+        if compress_ratio == 4:
+            self.state_cache = CompressorStateCache(state_dim=2 * coff * head_dim, ..., block_size=8)
+        elif compress_ratio == 128:
+            self.state_cache = CompressorStateCache(state_dim=2 * head_dim, ..., block_size=32)
+```
+
+**`overlap_transform`**（lines 538-543）：V4 特有的 overlap 变换
+```python
+def overlap_transform(self, tensor, value=0):
+    # tensor: (b, s, 2, d) → 展开为 (b, s, 2*ratio, d)
+    # 将前半部分重叠到下一时间步，实现窗口滑动
+```
+
+**`rope_single`**（lines 555-578）：使用 `torch_npu.npu_rotary_mul` 硬件加速的 RoPE
+```python
+def rope_single(self, x, cos, sin, inverse=False):
+    x_rot = torch_npu.npu_rotary_mul(
+        x.reshape(num_tokens, num_heads, 1, rotary_dim).to(torch.float32),
+        cos, sin, rotary_mode="interleave"
+    )
+```
+
+---
+
+### 4.6 详解：`DeepseekV4Attention`（注意力层）
+
+```
+ds_v4.py`, lines 581-767
+```
+
+Ascend 的注意力层是一个**封装层**，内部将实际计算委托给 `AscendDeepseekSparseAttention`（DSA）。
+
+**初始化**（lines 582-758）：
+
+```python
+class DeepseekV4Attention(nn.Module):
+    def __init__(self, vllm_config, config, max_position_embeddings, cache_config, quant_config, prefix, topk_indices_buffer):
+        # MLA 投影
+        self.wq_a = ReplicatedLinear(dim, q_lora_rank, ...)          # W_Q_A（不同于 NVIDIA 的 fused_wqa_wkv）
+        self.q_norm = RMSNorm(q_lora_rank, ...)
+        wq_b_cls = ReplicatedLinear if self.enable_dsa_cp else ColumnParallelLinear
+        self.wq_b = wq_b_cls(q_lora_rank, n_heads * head_dim, ...)   # W_Q_B
+        
+        self.wkv = ReplicatedLinear(dim, head_dim, ...)               # W_KV（与 W_Q_A 分离！）
+        self.kv_norm = RMSNorm(head_dim, ...)
+        
+        self.wo_a = ColumnParallelLinear(n_heads * head_dim // n_groups, ...)  # W_O_A
+        self.wo_b = RowParallelLinear(n_groups * o_lora_rank, dim, ...)       # W_O_B
+        
+        # RoPE（使用 Ascend 专用的 ComplexExpRotaryEmbedding）
+        self.rotary_emb = ComplexExpRotaryEmbedding(
+            vllm_config=vllm_config, layername=..., head_size=rope_head_dim, ...
+        )
+        
+        # Compressor + Indexer（压缩比 >1 时启用）
+        if compress_ratio > 1:
+            self.compressor = Compressor(...)
+            if compress_ratio == 4:
+                self.indexer = Indexer(...)
+        
+        # DSA 模块聚合（将所有子模块打包传入 DSA）
+        dsa_modules = DSAModules(
+            wq_a=self.wq_a, q_norm=self.q_norm, wq_b=self.wq_b,
+            wkv=self.wkv, kv_norm=self.kv_norm,
+            wo_a=self.wo_a, wo_b=self.wo_b,
+            attn_sink=self.attn_sink,
+            indexer=self.indexer, compressor=self.compressor,
+            topk_indices_buffer=topk_indices_buffer,
+            skip_topk=skip_topk,
+        )
+        
+        # 实例化 DSA 注意力（真正执行计算的类）
+        self.dsa_attn = AscendDeepseekSparseAttention(
+            dim=self.dim, n_heads=self.n_heads, scale=self.scale,
+            dsa_modules=dsa_modules, cache_config=cache_config, ...
+        )
+```
+
+**forward**（lines 761-767）：
+
+```python
+def forward(self, positions, hidden_states, llama_4_scaling):
+    return self.dsa_attn(positions, hidden_states, llama_4_scaling)
+```
+
+**与 NVIDIA 的 Attention 关键区别**：
+
+| 维度 | NVIDIA | Ascend |
+|------|--------|--------|
+| W_Q_A + W_KV | `fused_wqa_wkv` 合并为线性层 | `wq_a` + `wkv` 分离为两个线性层 |
+| `wq_b` 切分 | `ColumnParallelLinear`（TP 切分） | `ReplicatedLinear` 或 `ColumnParallelLinear`（由 `enable_dsa_cp` 决定） |
+| 稀疏索引 | vLLM AttentionBackend 管理 | DSA 内部集成（`skip_topk` 策略） |
+| RoPE | `build_deepseek_v4_rope()` 36 行辅助 | `ComplexExpRotaryEmbedding` 238 行完整类 |
+| NLP 注意力 | `npu_rotary_mul` 硬件加速 | 复数乘法 |
+
+---
+
+### 4.7 详解：DSA 注意力核心（`AscendDeepseekSparseAttention`）
+
+```
+ops/dsa.py`, lines 60-272
+```
+
+```python
+class AscendDeepseekSparseAttention(MultiHeadLatentAttentionWrapper):
+    def __init__(self, ..., dsa_modules, ...):
+        # 从 DSAModules 中获取所有子模块
+        self.wq_a = dsa_modules.wq_a
+        self.q_norm = dsa_modules.q_norm
+        ...
+        self.swa_cache_layer = DeepseekV4SWACache(...)  # SWA 窗口缓存
+        
+        # C++ 实现的 DSA 注意力（关键的 NPU 算子）
+        self.dsa_attn = DSAAttention(dim=dim, n_heads=n_heads, ..., cache_config=..., ...)
+    
+    def forward(self, positions, hidden_states, kv_cache=None, attn_metadata=None):
+        # 所有 DSA 前向路径都通过 dsa_forward custom op 执行
+        # 这是为了 ACL graph capture（NPU 计算图捕获）的需要
+        torch.ops.vllm.dsa_forward(hidden_states, need_gather_q_kv, output, self.prefix)
+        return output
+```
+
+**`dsa_forward` custom op**（lines 183-224）：
+
+```python
+def dsa_forward(hidden_states, need_gather_q_kv, output, layer_name):
+    # 从 forward context 获取当前层的 self
+    self = forward_context.no_compile_layers[layer_name]
+    
+    if attn_metadata is None:
+        # Warmup: 预分配 workspace
+        self.dsa_attn.impl.dsa_warmup_with_multistream(hidden_states)
+        output.fill_(0)
+    else:
+        # 构建 KV cache 六元组
+        kv_cache = _build_kv_cache(self, forward_context)
+        # 调用 C++ DSA forward
+        self.dsa_attn.impl.forward(self.dsa_attn.layer_name, hidden_states, kv_cache, ...)
+```
+
+**`_build_kv_cache`**（lines 232-266）：
+
+```python
+def _build_kv_cache(self, forward_context):
+    """构建 DSA forward 需要的 6-tuple KV cache"""
+    return tuple([
+        compress_kv_cache,      # 压缩 KV cache
+        swa_kv_cache,           # SWA 窗口 cache
+        state_cache,            # Compressor 状态 cache
+        indexer_state_cache,    # Indexer 状态 cache
+        indexer_k_cache,        # Indexer K cache
+        indexer_scale_cache,    # Indexer scale cache
+    ])
+```
+
+DSA 的核心是 `DSAAttention`（C++ 实现，`vllm_ascend/models/layer/attention/layer.py`），它将整个 MLA 的 forward 路径——包括 Q 投影、RoPE、KV 压缩、稀疏 attention、输出投影——全部封装在一个 custom op 中，实现 NPU 上的计算图捕获优化。
+
+---
+
+### 4.8 详解：`DeepseekV2DecoderLayer`（解码器层）
+
+```
+deepseek_v4.py`, lines 770-860
+```
+
+```python
+class DeepseekV2DecoderLayer(nn.Module):
+    def __init__(self, vllm_config, prefix, config, topk_indices_buffer, is_draft_layer=False):
+        self.self_attn = DeepseekV4Attention(vllm_config, ...)  # 封装 DSA
+        self.mlp = DeepseekV4MoE(config, parallel_config, ...)
+        
+        # 独立的 LayerNorm（不同于 NVIDIA 的融合版本）
+        self.input_layernorm = RMSNorm(hidden_size, eps)
+        self.post_attention_layernorm = RMSNorm(hidden_size, eps)
+        
+        # HC 参数
+        self.hc_attn_fn = nn.Parameter(...)
+        self.hc_ffn_fn = nn.Parameter(...)
+    
+    def hc_pre(self, x, hc_fn, hc_scale, hc_base):
+        # 调用 Ascend 自定义算子
+        y = torch.ops._C_ascend.npu_hc_pre(x, hc_fn, hc_scale, hc_base, ...)
+        return y
+    
+    def hc_post(self, x, residual, post, comb):
+        # 调用 Ascend 自定义算子（注意 unsqueeze/squeeze）
+        y = torch.ops._C_ascend.npu_hc_post(
+            x.unsqueeze(dim=0), residual.unsqueeze(dim=0), ...)
+        return y.squeeze(dim=0)
+    
+    def forward(self, positions, hidden_states, residual, llama_4_scaling=None):
+        # ---- Attention 部分 ----
+        residual = hidden_states.clone()
+        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, ...)
+        hidden_states = self.input_layernorm(hidden_states)         # 显式 LayerNorm！
+        hidden_states = self.self_attn(positions, hidden_states, llama_4_scaling)
+        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        
+        # ---- FFN 部分 ----
+        residual = hidden_states.clone()
+        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, ...)
+        hidden_states = self.post_attention_layernorm(hidden_states)  # 显式 LayerNorm！
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        
+        return hidden_states, residual
+```
+
+**NVIDIA vs Ascend DecoderLayer 对照**：
+
+| 步骤 | NVIDIA | Ascend |
+|------|--------|--------|
+| 1 | `mhc_pre`（含 attn_norm 权重） | `npu_hc_pre` + 显式 `input_layernorm` |
+| 2 | `self.attn(positions, x, None)` | `self.self_attn(positions, hidden_states, llama_4_scaling)` |
+| 3 | `mhc_fused_post_pre_tilelang`（融合 post + FFN pre） | `npu_hc_post` + 显式 `post_attention_layernorm` |
+| 4 | `self.ffn(x, input_ids)` | `self.mlp(hidden_states)` |
+| 5 | 返回 `(x, residual, post_mix, res_mix)` 三态残差 | 返回 `(hidden_states, residual)` 两态残差 |
+| 签名 | `(x, positions, input_ids, post_mix, res_mix, residual)` | `(positions, hidden_states, residual, llama_4_scaling)` |
+
+---
+
+### 4.9 详解：`DeepseekV4Model`（主干网络）
+
+```
+deepseek_v4.py`, lines 864-1006
+```
+
+```python
+@support_torch_compile
+class DeepseekV4Model(nn.Module):
+    def __init__(self, *, vllm_config, prefix=""):
+        # Embed
+        self.embed_tokens = VocabParallelEmbedding(...)
+        
+        # Decoder layers
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: DeepseekV2DecoderLayer(vllm_config, prefix, ...),
+        )
+        self.norm = RMSNorm(...)
+        
+        # HC Head
+        self.hc_head_fn = nn.Parameter(...)
+        
+        # MTP hidden buffer
+        self._mtp_hidden_buffer = torch.empty(max_tokens, hc_dim, ...)
+    
+    def hc_head(self, x, hc_fn, hc_scale, hc_base):
+        """Ascend 的 hc_head 实现（纯 PyTorch，vs NVIDIA 的 tilelang kernel）"""
+        # 1. RMSNorm
+        rsqrt = torch.rsqrt(x.flatten(1).float().square().mean(-1, keepdim=True) + norm_eps)
+        # 2. Linear projection + sigmoid
+        mixes = torch.sigmoid(F.linear(x_flat, hc_fn) * rsqrt * hc_scale + hc_base) + hc_eps
+        # 3. Weighted sum over hc_mult streams
+        y = torch.sum(mixes.unsqueeze(-1) * x.view(shape), dim=1)
+        return y.to(dtype)
+    
+    def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds):
+        # 1. Embed
+        hidden_states = self.embed_input_ids(input_ids)
+        residual = None
+        
+        # 2. HC expand: (T, D) → (T, hc_mult, D)
+        hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        
+        # 3. Decoder layers
+        for layer in self.layers:
+            hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+        
+        # 4. MTP target hidden states（FlashComm1 时需 all_gather）
+        if flash_comm_v1_enabled:
+            h_states_flat = tensor_model_parallel_all_gather(hidden_states.flatten(1), dim=0)
+        else:
+            h_states_flat = hidden_states.flatten(1)
+        self._mtp_hidden_buffer[:num_tokens].copy_(h_states_flat)
+        
+        # 5. HC Head（纯 PyTorch）
+        hidden_states = self.hc_head(hidden_states, self.hc_head_fn, ...)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+```
+
+**与 NVIDIA 的 Model 关键区别**：
+
+| 维度 | NVIDIA | Ascend |
+|------|--------|--------|
+| `hc_head` | `hc_head_fused_kernel_tilelang`（tilelang kernel） | 纯 PyTorch：RMSNorm + Linear + sigmoid |
+| PP 中间张量 | `IntermediateTensors({"hidden_states": 3D})` | `IntermediateTensors({"hidden_states", "residual"})` |
+| 编译装饰器 | 无 | `@support_torch_compile` |
+| MTP buffer 管理 | 直接 copy_ | FlashComm1 时 all_gather + pad 处理 |
+| `make_empty_intermediate_tensors` | 自定义：`torch.zeros(batch, hc_mult, D)` | `make_empty_intermediate_tensors_factory(["hidden_states", "residual"], ...)` |
+
+---
+
+### 4.10 详解：`AscendDeepseekV4ForCausalLM`（顶层模型）
+
+```
+deepseek_v4.py`, lines 1049-1354
+```
+
+```python
+class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle):
+    packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    model_cls = DeepseekV4Model
+    
+    def __init__(self, *, vllm_config, prefix=""):
+        self.model = self.model_cls(vllm_config=vllm_config, prefix=...)
+        self.lm_head = ParallelLMHead(...)
+        self.logits_processor = LogitsProcessor(...)
+        self.set_moe_parameters()
+    
+    def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds):
+        hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        return hidden_states
+```
+
+**权重加载**（`load_weights`，lines 1138-1354）：
+
+```python
+def load_weights(self, weights):
+    # 1. 参数映射：V4 checkpoint 名称 → 模型参数名称
+    stacked_params_mapping = [
+        ("gate_up_proj", "gate_proj", 0),   # gate/up 合并
+        ("gate_up_proj", "up_proj", 1),
+    ]
+    expert_params_mapping = FusedMoE.make_expert_params_mapping(...)
+    
+    for name, loaded_weight in weights:
+        # 2. 跳过 MTP 层
+        if get_spec_layer_idx_from_weight_name(config, name):
+            continue
+        
+        # 3. 名称重映射（大量 replace）
+        name = name.replace(".w1.", ".gate_proj.")
+        name = name.replace(".w2.", ".down_proj.")
+        name = name.replace(".w3.", ".up_proj.")
+        name = name.replace(".ffn.", ".mlp.")
+        name = name.replace(".attn.", ".self_attn.")
+        name = name.replace("model.head.", "lm_head.")
+        ...
+        
+        # 4. Attn sink 特殊处理（DSA CP 时全量复制）
+        if "sink" in name:
+            if enable_dsa_cp():
+                param.data.copy_(loaded_weight)
+            else:
+                narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
+        
+        # 5. mix_placement 时的 shared experts 处理
+        if is_fusion_moe_shared_experts_layer:
+            # 将 shared expert 权重按 n_shared_experts 分割
+            for j in range(num_chunks):
+                chunk_name = name.replace("mlp.shared_experts", f"mlp.experts.{n_routed_experts + j}")
+                ...
+```
+
+**`get_expert_mapping`**（lines 1119-1129）：当 `mix_placement=True` 时，专家总数会包含 shared experts：
+```python
+def get_expert_mapping(self):
+    return FusedMoE.make_expert_params_mapping(
+        self.model,
+        num_experts=self.config.n_routed_experts
+            + (self.config.n_shared_experts if mix_placement else 0),
+        ...
+    )
+```
+
+---
+
+### 4.11 详解：`ComplexExpRotaryEmbedding`（Ascend 专用 RoPE）
+
+```
+ops/rope_dsv4.py`, lines 104-237
+```
+
+**全局状态**（lines 13-21）：
+```python
+class RopeGlobalState:
+    def __init__(self):
+        self.static_cache: dict = {}           # cos/sin 静态缓存
+        self.runtime_buffer: dict = {}          # 运行时 buffer
+        self.layer_info: dict = {}              # 层 → 配置映射
+        self.registry_summary: dict = {}        # 配置 → group 映射
+```
+
+**初始化**（`__init__`，lines 117-166）：
+```python
+class ComplexExpRotaryEmbedding(nn.Module):
+    def __init__(self, vllm_config, layername, head_size, ...):
+        # 1. 生成全局唯一的配置 key
+        config_key = f"rotary_dim{rotary_dim}_base{base}_scaling_factor{scaling_factor}_..."
+        
+        # 2. 注册此层的配置信息
+        _ROPE_STATE.layer_info[layername] = (config_key, rope_groups)
+        
+        # 3. 静态缓存：预计算所有位置的 cos/sin
+        if config_key not in _ROPE_STATE.static_cache:
+            inv_freq = self.precompute_freqs_cis(...)  # YaRN NTK scaling
+            freqs = torch.einsum("i,j -> ij", t, inv_freq)
+            cos = freqs.cos().repeat_interleave(2, dim=-1)
+            sin = freqs.sin().repeat_interleave(2, dim=-1)
+            _ROPE_STATE.static_cache[config_key] = (cos, sin)
+        
+        # 4. 运行时 buffer（避免每次 forward 重新分配）
+        if config_key not in _ROPE_STATE.runtime_buffer:
+            buf_cos = torch.ones(max_batch, 1, 1, rotary_dim, ...)
+            buf_sin = torch.zeros(max_batch, 1, 1, rotary_dim, ...)
+            _ROPE_STATE.runtime_buffer[config_key][grp] = (buf_cos, buf_sin)
+```
+
+**forward**（lines 217-234）：
+```python
+def forward(self, x, cos, sin):
+    # 使用 torch_npu 硬件加速的 rotary_mul
+    x = torch_npu.npu_rotary_mul(x, cos, sin, rotary_mode="interleave")
+    return x
+```
+
+**`get_cos_and_sin_dsa`**（lines 63-101）：为 DSA 注意力提供 cos/sin 值
+```python
+def get_cos_and_sin_dsa(positions, use_cache=False):
+    # 从静态查表获取当前 positions 对应的 cos/sin
+    curr_cos = static_cos[pos_tensor]
+    curr_sin = static_sin[pos_tensor]
+    
+    if use_cache:
+        # 复制到运行时 buffer（避免分配新张量）
+        buf_cos[:num_tokens].copy_(curr_cos)
+        return (buf_cos, buf_sin)
+    return (curr_cos, curr_sin)
+```
+
+**RoPE 功能总结**：
+- 支持多组 RoPE（default + c4/c128），每组有自己的 cos/sin
+- 通过 `RopeGlobalState` 全局共享缓存，避免重复计算
+- 使用 `RopeDataProxy` 实现按层名或配置的矢量化索引
+- 底层使用 `torch_npu.npu_rotary_mul` 硬件加速
+
+---
+
+### 4.12 详解：MTP（Multi-Token Prediction）—— Ascend 版本
+
+**文件**：`models/deepseek_v4_mtp.py`
+
+由于篇幅限制，这里仅概括与 vLLM NVIDIA 的差异：
+
+| 维度 | NVIDIA MTP | Ascend MTP |
+|------|-----------|------------|
+| Decoder 复用 | `DeepseekV4DecoderLayer`（V4 特有） | `DeepseekV2DecoderLayer` + `DeepseekV4MoE` |
+| SharedHead | 从 `vllm/model_executor/models/ds_mtp.py` 导入 | 自定义 `SharedHead`（含 RMSNorm） |
+| HC Head | `hc_head_fused_kernel_tilelang` | 纯 PyTorch `hc_head` 方法 |
+| Key 操作 | `fused_mtp_input_rmsnorm`（Triton） | 同样使用 `fused_mtp_input_rmsnorm` 但内部调用 NPU 算子 |
+| `compute_logits` | `hc_head` + `mtp_shared_head_rmsnorm` | 类似逻辑，但 hc_head 是纯 PyTorch |
+| 权重加载 | `_remap_weight_name` + `get_spec_layer_idx` | `get_spec_layer_idx_from_weight_name`（相同逻辑） |
+
+---
+
+## 五、核心实现对比
+
+### 5.1 注意力机制（MLA）
 
 | 维度 | vLLM（NVIDIA） | vLLM-Ascend |
 |------|---------------|-------------|
@@ -757,109 +1423,84 @@ class DeepseekV4FP8Config(Fp8Config):
 | **后端选择** | 运行时可选 FlashMLA / FlashInfer | 编译时固定的 DSA |
 | **类名** | `DeepseekV4FlashMLAAttention` | `AscendDeepseekSparseAttention` |
 | **继承链** | ← `DeepseekV4Attention`（ABC） | ← `MultiHeadLatentAttentionWrapper` |
-| **CUDA/NPU 算子** | FlashMLA kernel 或 FlashInfer TRTLLM-gen | `torch_npu` 原生算子 + DSA 模块 |
+| **CUDA/NPU 算子** | FlashMLA kernel 或 FlashInfer TRTLLM-gen | `torch_npu` 原生算子 + DSA C++ 模块 |
 | **KV cache 格式** | UE8M0 block-scaled FP8 (uint8) / bf16 | DSA 原生格式 |
-| **Indexer Cache** | `DeepseekV4IndexerCache`（在 `attention.py`） | 直接 import vLLM 的 IndexerCache |
+| **W_Q_A + W_KV** | `fused_wqa_wkv` 合并 | `wq_a` + `wkv` 分离 |
+| **Indexer Cache** | `DeepseekV4IndexerCache`（`attention.py`） | 直接 import vLLM 的 IndexerCache |
 
-**vLLM 的注意力选择逻辑**：
-```python
-# nvidia/model.py:726
-def _select_dsv4_attn_cls(vllm_config):
-    if backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4:
-        return DeepseekV4FlashInferMLAAttention  # FlashInfer TRTLLM-gen 路径
-    return DeepseekV4FlashMLAAttention           # FlashMLA 路径（默认）
-```
-
-**vLLM-Ascend 的集成方式**：
-```python
-# ds_v4.py
-dsa_modules = DSAModules(
-    rope_emb=self.rope_emb,
-    indexer_cache=self.indexer_cache,
-)
-self.dsa_attn = AscendDeepseekSparseAttention(
-    config=config,
-    dsa_modules=dsa_modules,
-)
-# forward 时直接调用
-hidden_states = self.dsa_attn(hidden_states=hidden_states, positions=positions, ...)
-```
-
-### 4.2 DecoderLayer 前向传播
-
-**vLLM（NVIDIA）**：使用 `tilelang` 实现的 `mhc_pre_tilelang` / `mhc_fused_post_pre_tilelang`
-```python
-# 第一层：独立 mhc_pre → 后续层：融合 mhc_fused_post_pre
-# attn_norm 已融合在 mhc_pre/mhc_fused_post_pre 中
-# forward 签名: (x, positions, input_ids, post_mix, res_mix, residual)
-```
-
-**vLLM-Ascend**：使用 `torch.ops._C_ascend.npu_hc_pre` / `npu_hc_post`
-```python
-# 显式的 input_layernorm + post_attention_layernorm（未融合）
-# forward 签名: (positions, hidden_states, residual, llama_4_scaling)
-```
+### 5.2 DecoderLayer 前向传播
 
 | 特征 | vLLM（NVIDIA） | vLLM-Ascend |
 |------|---------------|-------------|
 | HC 算子 | `mhc_pre_tilelang`（tilelang 编译） | `npu_hc_pre` / `npu_hc_post`（Ascend 自定义算子） |
-| Norm 融合 | attn_norm 融合在 mhc_pre 中 | 独立的 RMSNorm layer |
-| 残差管理 | 三态 `(residual, post_mix, res_mix)` | 两态 `(residual, post + comb)` |
+| Norm | attn_norm 融合在 mhc_pre 中 | 独立的 `input_layernorm` / `post_attention_layernorm` |
+| 残差管理 | 三态 `(residual, post_mix, res_mix)` | 两态 `(residual, post+comb)` |
 | 编译装饰器 | 无 | `@support_torch_compile` |
-| 签名参数 | 6 参数（含 post_mix/res_mix） | 4 参数（更简洁） |
+| 签名 | `(x, positions, input_ids, post_mix, res_mix, residual)` | `(positions, hidden_states, residual, llama_4_scaling)` |
 
-### 4.3 MoE（混合专家层）
+### 5.3 MoE（混合专家层）
 
 | 维度 | vLLM（NVIDIA） | vLLM-Ascend |
 |------|---------------|-------------|
 | MoE 实现 | `FusedMoE` + `DeepseekV4MegaMoEExperts` | `FusedMoE` + `mix_placement` |
-| Shared Experts | 标准实现（DeepseekV4MLP） | 支持 `mix_placement`（混合放置） |
+| Shared Experts | 独立 `DeepseekV4MLP` | 支持 `mix_placement`（集成到 FusedMoE） |
 | MegaMoE | `DeepseekV4MegaMoEExperts`（FP4, SM100 专用） | 无 |
-| 专家并行 | 支持 EPLB | 支持 EPLB |
+| Gate 精度 | `GateLinear` + `out_dtype=torch.float32` | `ReplicatedLinear` + `precast_fp32_weight=True` |
+| 专家量化 | FP4（`DeepseekV4MegaMoEExperts`）或 FP8 | FP8 泛化（FusedMoE） |
+| Grouped topk | 隐式 | 显式 `use_grouped_topk=True` |
 
-**Ascend 独有的 `mix_placement`**：
-```python
-self.is_fusion_moe_shared_experts_enabled = getattr(
-    get_ascend_config(), "mix_placement", False
-)
-if config.n_shared_experts is None or self.is_fusion_moe_shared_experts_enabled:
-    self.shared_experts = None  # 由 FusedMoE 统一管理
-```
-
-### 4.4 MTP（Multi-Token Prediction）
-
-| 维度 | vLLM（NVIDIA） | vLLM-Ascend |
-|------|---------------|-------------|
-| 实现文件 | `nvidia/mtp.py` + `model_executor/models/ds_mtp.py` | `ds_v4_mtp.py` |
-| 类名 | `DSV4MTP` | `DeepSeekV4MTP` |
-| 注册名 | — | `DeepSeekV4MTPModel` |
-| SharedHead | 使用 `SharedHead`（从 `ds_mtp.py` 引入） | 自定义 `SharedHead`（含 RMSNorm） |
-| Decoder 复用 | `DeepseekV4DecoderLayer` | `DeepseekV2DecoderLayer` + `DeepseekV4MoE` |
-| 关键操作 | `fused_mtp_input_rmsnorm`（Triton 算子） | 类似逻辑（复用 vLLM 版本） |
-
-### 4.5 RoPE（旋转位置编码）
+### 5.4 RoPE
 
 | 维度 | vLLM | vLLM-Ascend |
 |------|------|-------------|
 | 文件 | `common/rope.py`（36 行） | `ops/rope_dsv4.py`（237 行） |
-| 功能 | 辅助函数 `build_deepseek_v4_rope()` | 完整 `ComplexExpRotaryEmbedding` 类 |
-| 缓存 | 无 | `RopeDataProxy` 支持 cos/sin 缓存 |
-| 与注意力集成 | FlashMLA 内部处理 | DSA 专用的 `get_cos_and_sin_dsa()` |
+| 实现 | 辅助函数 `build_deepseek_v4_rope()` | 完整 `ComplexExpRotaryEmbedding` 类 |
+| 缓存 | 无 | `RopeDataProxy` 支持静态 + 运行时缓存 |
+| 硬件加速 | CUDA kernel 内部处理 | `torch_npu.npu_rotary_mul` |
 
-### 4.6 其他差异
+### 5.5 HC Head
+
+| 维度 | vLLM（NVIDIA） | vLLM-Ascend |
+|------|---------------|-------------|
+| 实现 | `hc_head_fused_kernel_tilelang`（tilelang） | 纯 PyTorch（`rsqrt` + `sigmoid` + `linear`） |
+
+### 5.6 其他差异
 
 | 维度 | vLLM | vLLM-Ascend |
 |------|------|-------------|
 | 量化 | `DeepseekV4FP8Config`（FP4/FP8） | 复用 vLLM 通用 FP8 |
 | DSA Context Parallel | 无 | 独有 `enable_dsa_cp()` |
-| 量化路由 | `config.py` 中自动重写 `quant_method` | 无特殊路由 |
-| 权重映射器 | `_make_deepseek_v4_weights_mapper(expert_dtype)` | 标准 `default_weight_loader` |
+| 接口支持 | `SupportsPP` + `DeepseekV4MixtureOfExperts` | `SupportsPP` + `SupportsEagle` + `SupportsLoRA` |
 
 ---
 
-## 五、详细文件映射
+## 六、总结
 
-### 5.1 vLLM DS V4 文件结构
+| 维度 | vLLM 策略 | vLLM-Ascend 策略 |
+|------|-----------|-----------------|
+| **代码组织** | 36 个文件，硬件隔离子目录 | 2 个主文件 + 2 个 ops，单体结构 |
+| **注意力** | FlashMLA / FlashInfer（CUDA 生态） | AscendDeepseekSparseAttention（NPU 原生 DSA） |
+| **Hybrid Chunk** | `mhc_pre_tilelang`（tilelang 编译，Norm 融合） | `npu_hc_pre` / `npu_hc_post`（Ascend 自定义算子，显式 Norm） |
+| **MoE** | 标准 TP + DeepseekV4MegaMoE（SM100） | 标准 EP + mix_placement |
+| **RoPE** | 36 行辅助函数 | 237 行完整类 + 缓存 + DSA 集成 |
+| **HC Head** | `hc_head_fused_kernel_tilelang`（tilelang kernel） | 纯 PyTorch 实现 |
+| **量化** | `DeepseekV4FP8Config`（FP4/FP8 专用配置） | 复用 vLLM 通用 FP8 |
+| **接口** | SupportsPP + DeepseekV4MixtureOfExperts | SupportsPP + SupportsEagle + SupportsLoRA |
+| **编译优化** | CUDA graph | `@support_torch_compile` + DSA custom op graph capture |
+
+**一句话总结**：vLLM 的 DS V4 适配是**全栈自研 + CUDA 生态依赖**模式（FlashMLA、FlashInfer、cutedsl、tilelang），vLLM-Ascend 是**复用共享层 + 替换关键路径为 NPU 原生算子**模式——复用 vLLM 的 IndexerCache、Compressor、FusedMoE，替换注意力（DSA）、RoPE（ComplexExpRotaryEmbedding）、HC（npu_hc_pre/post）、HC Head（纯 PyTorch）为昇腾 NPU 实现。两者都适配了 DS V4 的核心架构（MLA + MoE + MTP + HC），只是底层硬件算子不同。
+
+---
+
+**文档版本**: v3.0  
+**创建时间**: 2026-06-27  
+**基于源码**: `vllm/vllm/models/deepseek_v4/` + `vllm-ascend/vllm_ascend/models/deepseek_v4.py` + `vllm-ascend/vllm_ascend/ops/dsa.py` + `vllm-ascend/vllm_ascend/ops/rope_dsv4.py`
+
+---
+
+## 附：文件结构清单
+
+### vLLM DS V4 文件结构
 
 | 目录/文件 | 行数 | 作用 |
 |----------|------|------|
@@ -881,12 +1522,12 @@ if config.n_shared_experts is None or self.is_fusion_moe_shared_experts_enabled:
 | **`xpu/mtp.py`** | — | Intel XPU MTP 实现 |
 | **`model_executor/models/ds_mtp.py`** | 516 | MTP 模型注册与权重加载 |
 
-### 5.2 vLLM-Ascend DS V4 文件结构
+### vLLM-Ascend DS V4 文件结构
 
 | 文件 | 行数 | 作用 |
 |------|------|------|
-| **`models/ds_v4.py`** | 1,354 | 完整的模型实现（MLP, MoE, DecoderLayer, ForCausalLM） |
-| **`models/ds_v4_mtp.py`** | 506 | MTP 实现（复用主模型层） |
+| **`models/deepseek_v4.py`** | 1,354 | 完整的模型实现（MLP, MoE, DecoderLayer, ForCausalLM） |
+| **`models/deepseek_v4_mtp.py`** | 506 | MTP 实现（复用主模型层） |
 | **`ops/dsa.py`** | 272 | Ascend Deepseek Sparse Attention |
 | **`ops/rope_dsv4.py`** | 237 | DS V4 专用的 RoPE 实现 |
 
@@ -909,6 +1550,6 @@ if config.n_shared_experts is None or self.is_fusion_moe_shared_experts_enabled:
 
 ---
 
-**文档版本**: v2.0  
+**文档版本**: v3.0  
 **创建时间**: 2026-06-27  
-**基于源码**: `vllm/vllm/models/deepseek_v4/` + `vllm-ascend/vllm_ascend/models/ds_v4.py`
+**基于源码**: `vllm/vllm/models/deepseek_v4/` + `vllm-ascend/vllm_ascend/models/deepseek_v4.py` + `vllm-ascend/vllm_ascend/ops/dsa.py` + `vllm-ascend/vllm_ascend/ops/rope_dsv4.py`
