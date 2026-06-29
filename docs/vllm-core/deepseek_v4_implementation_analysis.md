@@ -96,7 +96,29 @@ DeepSeek V4 ForCausalLM
 
 ## 三、vLLM 源码解读（NVIDIA 路径）
 
-### 3.1 修改文件一览
+### 3.1 模块功能一览
+
+| 模块 | 类/文件 | 行数 | 核心功能 |
+|------|---------|------|---------|
+| **MLP** | `DeepseekV4MLP` in `nvidia/model.py` | 70-118 | SwiGLU 前馈网络（MeragedColumnParallelLinear + RowParallelLinear + SiLU） |
+| **MoE（门控 + 路由）** | `DeepseekV4MoE` in `nvidia/model.py` | 478-724 | 双后端路由（MegaMoE/FusedMoE）、shared experts、GateLinear sqrtsoftplus 评分 |
+| **MoE（FP4 专家）** | `DeepseekV4MegaMoEExperts` in `nvidia/model.py` | 140-473 | SM100 专用 FP4 专家、DeepGEMM 权重变换、EPLB 负载均衡、对称缓冲区 |
+| **注意力（基类）** | `DeepseekV4Attention` in `attention.py` | 98-618 | MLA 抽象基类、融合 W_Q_A+W_KV 投影、Q/KV 低秩分解、Indexer 管理 |
+| **注意力（FlashMLA）** | `DeepseekV4FlashMLAAttention` in `nvidia/flashmla.py` | 33-320 | FlashMLA kernel 预填充/解码、FlashMLA FP8 KV cache、fp8_o_proj |
+| **注意力（FlashInfer）** | `DeepseekV4FlashInferMLAAttention` in `nvidia/flashinfer_sparse.py` | ~80 | FlashInfer TRTLLM-gen 路径、bf16/FP8 KV cache |
+| **DecoderLayer** | `DeepseekV4DecoderLayer` in `nvidia/model.py` | 740-885 | tilelang HC（mhc_pre/fused_post_pre）、三态残差流、attn_norm 融合 |
+| **Model** | `DeepseekV4Model` in `nvidia/model.py` | 888-1057 | Embed → HC 扩展 → DecoderLayers → HC Head（tilelang）、MTP buffer |
+| **ForCausalLM** | `DeepseekV4ForCausalLM` in `nvidia/model.py` | 1251-1337 | 顶层模型、权重映射器（_make_deepseek_v4_weights_mapper）、MegaMoE 权重转换 |
+| **MTP** | `DSV4MTP` in `nvidia/mtp.py` | 260-380 | Multi-Token Prediction、e_proj/h_proj 分离、hc_head 延迟到 compute_logits |
+| **Indexer** | `DeepseekV4Indexer` in `attention.py` | 662-800 | C4 稀疏索引、topk 选择、压缩分数计算 |
+| **Sparse MLA Backend** | `DeepseekV4FlashMLABackend` in `sparse_mla.py` | 416 | AttentionBackend 接口、KV cache 格式定义、Metadata 构建 |
+| **Compressor** | `CompressorStateCache` in `compressor.py` | 399 | KV cache 压缩状态缓存 |
+| **RoPE** | `build_deepseek_v4_rope` in `common/rope.py` | 36 | RoPE 辅助函数 |
+| **共享算子** | 8 个文件 in `common/ops/` | ~2,700 | Triton 实现的 KV cache 管理、融合算子 |
+| **NV 专用算子** | 6 个文件 in `nvidia/ops/` | ~3,400 | CuteDSL 实现 sparse_attn、o_proj、dequant、indexer、megamoe |
+| **量化配置** | `DeepseekV4FP8Config` in `quant_config.py` | 160 | FP4/FP8 专家量化、NVFP4 (SM100) 配置 |
+
+### 3.2 修改文件一览
 
 所有模型代码位于 `vllm/models/deepseek_v4/` 目录下，按硬件平台分三个子目录：
 
@@ -750,6 +772,22 @@ class DeepseekV4FP8Config(Fp8Config):
 ## 四、vLLM-Ascend 源码详解
 
 > vLLM-Ascend 的 DS V4 模型全部实现在 `vllm_ascend/models/deepseek_v4.py`（1,355 行）这一个文件中，外加两个自定义算子文件（`ops/dsa.py` 272 行 + `ops/rope_dsv4.py` 238 行），结构远比 vLLM 的 36 个文件精简。
+
+### 4.0 模块功能一览
+
+| 模块 | 类/文件 | 行数 | 核心功能 |
+|------|---------|------|---------|
+| **MLP** | `DeepseekV2MLP` in `deepseek_v4.py` | 184-226 | SwiGLU 前馈网络，与 NVIDIA 实现一致 |
+| **MoE** | `DeepseekV4MoE` in `deepseek_v4.py` | 229-385 | `mix_placement` 混合放置、FusedMoE 统一管理 routed+shared、`muls_add_triton` 融合 |
+| **Indexer** | `Indexer` in `deepseek_v4.py` | 404-468 | 空 forward、参数/缓存管理、KV cache 类型按设备区分（A5: fp8 vs int8） |
+| **Compressor** | `Compressor` in `deepseek_v4.py` | 471-578 | WKV/Wgate 分离、overlap_transform、`npu_rotary_mul` 硬件加速、state cache |
+| **Attention（DSA 封装）** | `DeepseekV4Attention` in `ds_v4.py` | 581-767 | DSA 封装层、W_Q_A/W_KV 分离、ComplexExpRotaryEmbedding、skip_topk 策略 |
+| **DSA 注意力核心** | `AscendDeepseekSparseAttention` in `ops/dsa.py` | 60-272 | C++ DSA custom op、6-tuple KV cache、ACL graph capture、warmup |
+| **DecoderLayer** | `DeepseekV2DecoderLayer` in `ds_v4.py` | 770-860 | `npu_hc_pre/post` 自定义算子、显式 LayerNorm、两态残差流 |
+| **Model** | `DeepseekV4Model` in `deepseek_v4.py` | 864-1006 | `@support_torch_compile`、纯 PyTorch hc_head、FlashComm1 all_gather |
+| **ForCausalLM** | `AscendDeepseekV4ForCausalLM` in `ds_v4.py` | 1049-1354 | 多继承（SupportsPP+LoRA+Eagle）、mix_placement 权重加载、大量名称 remap |
+| **MTP** | `DSV4MTP` in `deepseek_v4_mtp.py` | 506 | 复用主模型 DeepseekV2DecoderLayer、纯 PyTorch hc_head |
+| **RoPE** | `ComplexExpRotaryEmbedding` in `ops/rope_dsv4.py` | 104-237 | `RopeGlobalState` 全局缓存、`npu_rotary_mul` 硬件加速、多组 RoPE 支持 |
 
 ### 4.1 文件结构与层次
 
