@@ -1,0 +1,13 @@
+## 目标：分析 vLLM vs vLLM-Ascend 对 DeepSeek V4 模型的适配差异
+
+### 第一轮：各自文件结构扫描
+- A1: 扫描 vLLM ds_v4/ 目录结构
+- A2: 扫描 vLLM-Ascend ds_v4 目录结构
+### 第二轮：深度对比
+- B1: 对比稀疏注意力实现 (sparse_mla.py vs dsa.py)
+- B2: 对比前向传播流程
+- B3: 对比 MTP 实现
+- B4: 对比 MoE 实现
+- B5: 对比量化和 RoPE
+### 第三轮：合成
+- C1: 汇总差异表格
